@@ -23,9 +23,19 @@
 #    07_IA_UF               - agregacao IA: vendas estimadas de IA por UF
 #    08_Registro_Resumo     - resumo por registro (venda total PF no periodo)
 #    09_IA_Resumo           - resumo por IA (a partir da comercializacao por IA)
-#    10_Agrofit_Sem_Vendas  - registros Agrofit sem comercializacao
-#    11_Vendas_Sem_Agrofit  - comercializacao sem match no Agrofit
-#    12_Validacao           - metricas de correspondencia
+#    10_Evol_Produtos_Anual - tabela WIDE: 1 linha por produto (Registro),
+#                             1 coluna por ANO com o volume vendido (PF) e
+#                             coluna TOTAL_PERIODO com a soma de todos os anos.
+#                             Pronta para graficos (tabela dinamica/grafico de
+#                             linhas) de evolucao anual de uso por produto.
+#    11_Evol_IA_Anual       - tabela WIDE: 1 linha por ingrediente ativo,
+#                             1 coluna por ANO com a venda ponderada/estimada
+#                             de IA e coluna TOTAL_PERIODO com a soma de todos
+#                             os anos. Pronta para graficos de evolucao anual
+#                             de uso por IA.
+#    12_Agrofit_Sem_Vendas  - registros Agrofit sem comercializacao
+#    13_Vendas_Sem_Agrofit  - comercializacao sem match no Agrofit
+#    14_Validacao           - metricas de correspondencia
 #
 #  Multi-IA na Tabela Bruta: o mesmo produto formulado aparece em N linhas
 #  (uma por ingrediente ativo), repetindo os volumes de PF. O script trata:
@@ -1276,6 +1286,94 @@ def montar_ia_anual(df_com_ia: pd.DataFrame) -> pd.DataFrame:
     return grp.sort_values(["ANO", "VENDA_TOTAL"], ascending=[True, False]).reset_index(drop=True)
 
 
+# ---------- Tabela 10: Evolucao_Produtos_Anual (WIDE: produto x ano) ----------
+# 1 linha por produto (Registro), 1 coluna por ANO com o volume total
+# comercializado (VENDAS_TOTAIS, perspectiva PRODUTO/PF) + coluna TOTAL_PERIODO
+# com a soma de todos os anos. Formato ideal para levantar graficos de
+# evolucao anual de uso por produto (linhas = produtos, colunas = anos) —
+# basta selecionar as colunas de ano e montar um grafico de linhas/tabela
+# dinamica diretamente no Excel.
+def montar_evolucao_produtos_anual(df_com_produto: pd.DataFrame) -> pd.DataFrame:
+    if (
+        df_com_produto.empty
+        or "ANO" not in df_com_produto.columns
+        or "VENDAS_TOTAIS" not in df_com_produto.columns
+    ):
+        return pd.DataFrame()
+
+    df = df_com_produto.copy()
+    if not pd.api.types.is_numeric_dtype(df["ANO"]):
+        df["ANO"] = converter_numero_br(df["ANO"])
+    df["ANO"] = df["ANO"].astype("Int64")
+    df["VENDAS_TOTAIS"] = pd.to_numeric(df["VENDAS_TOTAIS"], errors="coerce")
+    df = df[df["ANO"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+
+    campos_id = [c for c in ["NR_REGISTRO", "MARCA_COMERCIAL"] if c in df.columns]
+    if not campos_id:
+        return pd.DataFrame()
+
+    # 1 linha por produto x ano (soma caso ainda exista alguma granularidade extra)
+    agg = df.groupby(campos_id + ["ANO"], as_index=False)["VENDAS_TOTAIS"].sum()
+
+    pivot = agg.pivot_table(
+        index=campos_id, columns="ANO", values="VENDAS_TOTAIS", aggfunc="sum", fill_value=0
+    )
+    anos_ordenados = sorted(pivot.columns.tolist())
+    pivot = pivot[anos_ordenados]
+    colunas_ano = [str(int(a)) for a in anos_ordenados]
+    pivot.columns = colunas_ano
+    pivot["TOTAL_PERIODO"] = pivot[colunas_ano].sum(axis=1)
+    pivot = pivot.reset_index()
+    return pivot.sort_values("TOTAL_PERIODO", ascending=False).reset_index(drop=True)
+
+
+# ---------- Tabela 11: Evolucao_IA_Anual (WIDE: ingrediente ativo x ano) ----------
+# 1 linha por ingrediente ativo, 1 coluna por ANO com a venda ponderada/
+# estimada de IA (perspectiva IA) + coluna TOTAL_PERIODO com a soma de todos
+# os anos. Construida a partir de 06_IA_Anual (ja agregada por ANO x
+# INGREDIENTE_ATIVO), evitando somar novamente o volume de produto (PF).
+def montar_evolucao_ia_anual(df_ia_anual: pd.DataFrame) -> pd.DataFrame:
+    if (
+        df_ia_anual.empty
+        or "ANO" not in df_ia_anual.columns
+        or "INGREDIENTE_ATIVO" not in df_ia_anual.columns
+    ):
+        return pd.DataFrame()
+
+    valor_col = next(
+        (
+            c for c in ["VENDA_PONDERADA_IA", "VENDA_ESTIMADA_IA", "VENDA_TOTAL", "VENDA_TOTAL_PF"]
+            if c in df_ia_anual.columns
+        ),
+        None,
+    )
+    if valor_col is None:
+        return pd.DataFrame()
+
+    df = df_ia_anual.copy()
+    if not pd.api.types.is_numeric_dtype(df["ANO"]):
+        df["ANO"] = converter_numero_br(df["ANO"])
+    df["ANO"] = df["ANO"].astype("Int64")
+    df[valor_col] = pd.to_numeric(df[valor_col], errors="coerce")
+    df = df[df["ANO"].notna() & df["INGREDIENTE_ATIVO"].notna()]
+    df = df[df["INGREDIENTE_ATIVO"].astype(str).str.strip() != ""]
+    if df.empty:
+        return pd.DataFrame()
+
+    pivot = df.pivot_table(
+        index="INGREDIENTE_ATIVO", columns="ANO", values=valor_col, aggfunc="sum", fill_value=0
+    )
+    anos_ordenados = sorted(pivot.columns.tolist())
+    pivot = pivot[anos_ordenados]
+    colunas_ano = [str(int(a)) for a in anos_ordenados]
+    pivot.columns = colunas_ano
+    pivot["TOTAL_PERIODO"] = pivot[colunas_ano].sum(axis=1)
+    pivot = pivot.reset_index()
+    return pivot.sort_values("TOTAL_PERIODO", ascending=False).reset_index(drop=True)
+
+
 # ---------- Tabela 7: IA_UF ----------
 # Venda estimada de cada IA por UF = volume PF da UF do produto x ponderacao da IA.
 def montar_ia_uf(df_com_uf: pd.DataFrame, df_com_ia: pd.DataFrame) -> pd.DataFrame:
@@ -1462,6 +1560,7 @@ def montar_validacao(
 def montar_resumo_executivo(
     df_agrofit: pd.DataFrame, df_produtos: pd.DataFrame, df_agrofit_uso: pd.DataFrame,
     df_com_anual: pd.DataFrame, df_com_uf: pd.DataFrame, df_ia_anual: pd.DataFrame,
+    df_evol_produtos: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     indicadores = []
 
@@ -1514,19 +1613,39 @@ def montar_resumo_executivo(
             cresc = cresc.reset_index().sort_values("CRESCIMENTO_PERCENTUAL", ascending=False).head(10)
             rankings["Top10_IA_Crescimento"] = cresc
 
-    if not df_com_anual.empty and "MARCA_COMERCIAL" in df_com_anual.columns:
-        top_prod = (
-            df_com_anual.groupby("MARCA_COMERCIAL", as_index=False)["VENDAS_TOTAIS"].sum()
-            .sort_values("VENDAS_TOTAIS", ascending=False).head(20).reset_index(drop=True)
-        )
-        rankings["Top20_Produtos"] = top_prod
+    # Top20_Produtos: unifica o que antes eram dois rankings praticamente
+    # identicos (por MARCA_COMERCIAL e por NR_REGISTRO). Reaproveita a tabela
+    # WIDE de evolucao anual (10_Evol_Produtos_Anual) para trazer, quando
+    # houver mais de um ano de comercializacao, a quebra por ano, o numero de
+    # anos com venda e o crescimento % entre o primeiro e o ultimo ano.
+    if df_evol_produtos is None and not df_com_anual.empty:
+        df_evol_produtos = montar_evolucao_produtos_anual(df_com_anual)
 
-    if not df_com_anual.empty:
-        top_reg = (
-            df_com_anual.groupby("NR_REGISTRO", as_index=False)["VENDAS_TOTAIS"].sum()
-            .sort_values("VENDAS_TOTAIS", ascending=False).head(20).reset_index(drop=True)
-        )
-        rankings["Top20_Registros"] = top_reg
+    if df_evol_produtos is not None and not df_evol_produtos.empty:
+        top_prod = df_evol_produtos.head(20).copy()
+
+        if "DETENTOR" in df_com_anual.columns and "NR_REGISTRO" in top_prod.columns:
+            detentor_map = (
+                df_com_anual.dropna(subset=["DETENTOR"])
+                .drop_duplicates("NR_REGISTRO")
+                .set_index("NR_REGISTRO")["DETENTOR"]
+            )
+            top_prod.insert(
+                min(2, len(top_prod.columns)), "DETENTOR", top_prod["NR_REGISTRO"].map(detentor_map)
+            )
+
+        colunas_ano = [c for c in top_prod.columns if c.isdigit()]
+        if colunas_ano:
+            top_prod["NUM_ANOS_COM_VENDA"] = (top_prod[colunas_ano] > 0).sum(axis=1)
+        if len(colunas_ano) >= 2:
+            ano_ini, ano_fim = colunas_ano[0], colunas_ano[-1]
+            venda_ini = top_prod[ano_ini].astype(float)
+            venda_fim = top_prod[ano_fim].astype(float)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cresc = np.where(venda_ini > 0, 100 * (venda_fim - venda_ini) / venda_ini, np.nan)
+            top_prod[f"CRESCIMENTO_%_{ano_ini}_{ano_fim}"] = np.round(cresc, 2)
+
+        rankings["Top20_Produtos"] = top_prod
 
     if not df_com_uf.empty:
         top_uf = (
@@ -1650,9 +1769,11 @@ def gerar_excel(
         ("07_IA_UF", "IA_UF", "TabIAUF"),
         ("08_Registro_Resumo", "Registro_Resumo", "TabRegistroResumo"),
         ("09_IA_Resumo", "IA_Resumo", "TabIAResumo"),
-        ("10_Agrofit_Sem_Vendas", "Agrofit_Sem_Comercializacao", "TabAgrofitSemVendas"),
-        ("11_Vendas_Sem_Agrofit", "Comercializacao_Sem_Agrofit", "TabVendasSemAgrofit"),
-        ("12_Validacao", "Validacao", "TabValidacao"),
+        ("10_Evol_Produtos_Anual", "Evolucao_Produtos_Anual", "TabEvolProdutosAnual"),
+        ("11_Evol_IA_Anual", "Evolucao_IA_Anual", "TabEvolIAAnual"),
+        ("12_Agrofit_Sem_Vendas", "Agrofit_Sem_Comercializacao", "TabAgrofitSemVendas"),
+        ("13_Vendas_Sem_Agrofit", "Comercializacao_Sem_Agrofit", "TabVendasSemAgrofit"),
+        ("14_Validacao", "Validacao", "TabValidacao"),
     ]
     for nome_aba, chave_tabela, nome_tab in abas_numeradas:
         ws = wb.create_sheet(nome_aba)
@@ -1893,6 +2014,14 @@ def main() -> None:
     with Cronometro("Montar Tabela 6 - IA_Anual"):
         df_ia_anual = montar_ia_anual(df_com_ia)
 
+    with Cronometro("Montar Tabela 10 - Evolucao_Produtos_Anual"):
+        df_evol_produtos = montar_evolucao_produtos_anual(df_com_produto)
+        ok(f"{len(df_evol_produtos):,} produtos com serie historica anual")
+
+    with Cronometro("Montar Tabela 11 - Evolucao_IA_Anual"):
+        df_evol_ia = montar_evolucao_ia_anual(df_ia_anual)
+        ok(f"{len(df_evol_ia):,} ingredientes ativos com serie historica anual")
+
     with Cronometro("Montar Tabela 7 - IA_UF"):
         df_ia_uf = montar_ia_uf(df_com_uf, df_com_ia)
 
@@ -1916,7 +2045,8 @@ def main() -> None:
 
     with Cronometro("Montar resumo executivo e rankings"):
         df_resumo, rankings = montar_resumo_executivo(
-            df_agrofit, df_produtos, df_agrofit_uso, df_com_produto, df_com_uf, df_ia_anual
+            df_agrofit, df_produtos, df_agrofit_uso, df_com_produto, df_com_uf, df_ia_anual,
+            df_evol_produtos,
         )
 
     tabelas = {
@@ -1926,6 +2056,8 @@ def main() -> None:
         "Comercializacao_IA": df_com_ia.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
         "Comercializacao_UF": df_com_uf.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
         "IA_Anual": df_ia_anual,
+        "Evolucao_Produtos_Anual": df_evol_produtos,
+        "Evolucao_IA_Anual": df_evol_ia,
         "IA_UF": df_ia_uf,
         "Registro_Resumo": df_registro_resumo,
         "IA_Resumo": df_ia_resumo,
