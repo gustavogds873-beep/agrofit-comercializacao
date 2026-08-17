@@ -4,57 +4,48 @@
 #  ANALISE INTEGRADA AGROFIT x COMERCIALIZACAO DE AGROTOXICOS
 # =============================================================================
 #
-#  Script completo, executavel diretamente (Windows / Linux / macOS), que
-#  cruza a base de produtos formulados do Agrofit com as bases anuais de
-#  comercializacao de agrotoxicos, gerando uma estrutura analitica (star
-#  schema) com granularidades separadas para evitar duplicacao/multiplicacao
-#  artificial dos volumes comercializados.
+#  Script completo (Windows / Linux / macOS) que cruza a base de produtos
+#  formulados do Agrofit com as bases anuais de comercializacao de agrotoxicos,
+#  gerando uma estrutura analitica com granularidades separadas para evitar
+#  duplicacao/multiplicacao artificial dos volumes comercializados.
 #
-#  Abas geradas (duas perspectivas: produto consolidado x IA separada):
-#    00_Resumo              - indicadores, qualidade do match e rankings
-#    00_Legenda             - dicionario de colunas, premissas PF vs IA
-#    01_Produtos            - dimensao produto: cadastro Agrofit + KPIs de
-#                             venda + evolucao anual wide (ex-01+08+10)
-#    02_Comerc_Produto      - fato PRODUTO: 1 linha por Registro x Ano (PF)
-#    03_Comerc_IA           - fato IA: Registro x Ano x IA (originais + ponderados)
-#    04_Comerc_UF           - fato PRODUTO: vendas por UF (Registro x Ano x UF)
-#    05_IA_Anual            - agregacao IA: volumes por ingrediente ativo e ano
-#    06_IA_UF               - agregacao IA: vendas estimadas de IA por UF
-#    07_IA_Resumo           - resumo por IA + evolucao anual wide (ex-09+11)
-#    08_Evol_Produtos_Anual - tabela WIDE: 1 linha por produto (Registro),
-#                             1 coluna por ANO com volume PF + TOTAL_PERIODO
-#                             (paralela a evolucao de IA; ideal para graficos)
-#    09_Agrofit_Sem_Vendas  - registros Agrofit sem comercializacao
-#    10_Vendas_Sem_Agrofit  - comercializacao sem match no Agrofit
+#  Abas geradas:
+#    00_Resumo                         - indicadores, qualidade do match, rankings
+#    00_Legenda                        - dicionario, premissas PF vs IA
+#    01_Resumo_Agrofit                 - dimensao produto (cadastro Agrofit)
+#    02_Comercializacao_Produtos       - fato PF: 1 linha por Registro x Ano
+#    03_Evolucao_Produtos              - wide: produto x anos (volume PF)
+#    04_Comercializacao_IA             - fato IA: Registro x Ano x IA
+#    05_Vendas_IA                      - agregado: IA x Ano (volumes ponderados)
+#    06_Evolucao_IA                    - wide: IA x anos (volume ponderado)
+#    07_Comerc_Regional_Produtos       - fato PF: Registro x Ano x UF
+#    08_Comerc_Regional_IA             - fato IA: IA x Ano x UF
+#    09_Agrofit_Sem_Vendas             - Agrofit sem comercializacao no periodo
+#    10_Vendas_Sem_Agrofit             - comercializacao sem match no Agrofit
 #
-#  Removidas nesta versao:
-#    - 02_Agrofit_Uso (copia da base Agrofit; cultura/praga permanecem na origem)
-#    - 08/10/11/14 fundidas ou absorvidas (ver acima)
+#  Premissas multi-IA (Tabela Bruta):
+#    - O mesmo produto formulado aparece em N linhas (uma por IA), repetindo
+#      os volumes de PF. O script trata:
+#        * perspectiva PRODUTO -> first/max nos volumes PF (NAO soma)
+#        * perspectiva IA      -> mantem cada linha e aplica PONDERACAO_IA
 #
-#  Multi-IA na Tabela Bruta: o mesmo produto formulado aparece em N linhas
-#  (uma por ingrediente ativo), repetindo os volumes de PF. O script trata:
-#    - perspectiva PRODUTO -> first/max nos volumes PF (nao soma)
-#    - perspectiva IA     -> mantem cada linha e aplica PONDERACAO_IA da linha
-#
-#  Volumes de comercializacao:
+#  Volumes:
 #    - ORIGINAIS (auditoria): VENDAS_TOTAIS, VENDAS_CLIENTE, VENDAS_INDUSTRIA,
 #      PRODUCAO_NACIONAL, IMPORTACAO, EXPORTACAO, ESTOQUE_* — valores da planilha,
-#      sem ponderacao pelo teor de IA.
-#    - PONDERADOS (analise de IA): VENDA_PONDERADA_IA / VENDA_ESTIMADA_IA =
-#      volume original x PONDERACAO_IA — quantidade efetiva de ingrediente ativo.
-#  As colunas originais nunca sao sobrescritas pelo calculo ponderado.
+#      sem ponderacao pelo teor de IA. Nunca sao sobrescritos.
+#    - PONDERADOS (analise de IA): VENDA_PONDERADA_IA = volume original x
+#      PONDERACAO_IA — quantidade efetiva de ingrediente ativo.
 #
 #  Uso:
 #      python analise_integrada_agrofit_comercializacao.py
 #
-#  Estrutura de pastas esperada (criada automaticamente se nao existir):
-#      dados/      -> coloque aqui agrofitprodutosformulados.csv e os
-#                      arquivos anuais de comercializacao (.xlsx ou .csv)
-#      saida/      -> aqui sera gravado Relatorio_Comercializacao_Agrofit.xlsx
-#      logs/       -> aqui sera gravado analise_comercializacao.log
+#  Pastas (criadas automaticamente):
+#      dados/  -> agrofitprodutosformulados.csv + arquivos anuais (.xlsx/.csv)
+#      saida/  -> Relatorio_Comercializacao_Agrofit.xlsx
+#      logs/   -> analise_comercializacao.log
 #
-#  Consulte o README.md para detalhes de instalacao, execucao e o
-#  significado de cada aba gerada.
+#  Variaveis de ambiente opcionais:
+#      AGROFIT_DADOS_DIR, AGROFIT_SAIDA_DIR, AGROFIT_LOGS_DIR, AGROFIT_NO_INPUT
 # =============================================================================
 
 from __future__ import annotations
@@ -62,7 +53,6 @@ from __future__ import annotations
 import os
 import sys
 import re
-import glob
 import time
 import logging
 import unicodedata
@@ -73,14 +63,10 @@ from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Any
 
 # -----------------------------------------------------------------------
-# Garantia de dependencias (instala automaticamente se faltar)
+# Dependencias
 # -----------------------------------------------------------------------
 def _ensure_packages() -> None:
-    required = {
-        "pandas": "pandas",
-        "numpy": "numpy",
-        "openpyxl": "openpyxl",
-    }
+    required = {"pandas": "pandas", "numpy": "numpy", "openpyxl": "openpyxl"}
     missing = []
     for module_name, pip_name in required.items():
         try:
@@ -101,26 +87,19 @@ _ensure_packages()
 import pandas as pd
 import numpy as np
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.chart import LineChart, BarChart, Reference
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
-
 pd.set_option("mode.chained_assignment", None)
 
 # =============================================================================
-# CONFIGURACAO GERAL
+# CONFIGURACAO
 # =============================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Pastas padrao (ao lado do script). Podem ser sobrescritas por variaveis de
-# ambiente — util no Google Colab:
-#   AGROFIT_DADOS_DIR=/content/dados
-#   AGROFIT_SAIDA_DIR=/content/resultados
-#   AGROFIT_LOGS_DIR=/content/logs
 DADOS_DIR = Path(os.environ["AGROFIT_DADOS_DIR"]) if os.environ.get("AGROFIT_DADOS_DIR") else SCRIPT_DIR / "dados"
 SAIDA_DIR = Path(os.environ["AGROFIT_SAIDA_DIR"]) if os.environ.get("AGROFIT_SAIDA_DIR") else SCRIPT_DIR / "saida"
 LOGS_DIR = Path(os.environ["AGROFIT_LOGS_DIR"]) if os.environ.get("AGROFIT_LOGS_DIR") else SCRIPT_DIR / "logs"
@@ -128,12 +107,8 @@ LOGS_DIR = Path(os.environ["AGROFIT_LOGS_DIR"]) if os.environ.get("AGROFIT_LOGS_
 ARQUIVO_AGROFIT_PADRAO = "agrofitprodutosformulados.csv"
 ARQUIVO_SAIDA = "Relatorio_Comercializacao_Agrofit.xlsx"
 ARQUIVO_LOG = "analise_comercializacao.log"
-
-# Palavras-chave usadas para localizar automaticamente o arquivo do Agrofit
-# dentro da pasta dados/, caso o nome exato nao seja encontrado.
 PISTAS_NOME_AGROFIT = ["agrofit"]
 
-# As 27 siglas de UF esperadas nas bases de comercializacao
 UFS = [
     "RO", "AC", "AM", "RR", "PA", "AP", "TO", "MA", "PI", "CE", "RN", "PB",
     "PE", "AL", "SE", "BA", "MG", "ES", "RJ", "SP", "PR", "SC", "RS", "MS",
@@ -152,27 +127,36 @@ REGIAO_POR_UF = {
     "DF": "Centro-Oeste",
 }
 
-# Unidades reconhecidas como "de massa/volume" (compativeis para o calculo
-# de venda estimada de IA por ponderacao percentual). Unidades de contagem
-# (ex.: "UN", "PC") sao consideradas incompativeis para esse calculo.
 UNIDADES_COMPATIVEIS = {
     "KG", "L", "T", "TON", "TONELADA", "TONELADAS", "LITRO", "LITROS",
     "QUILOGRAMA", "QUILOGRAMAS", "G", "GRAMA", "GRAMAS", "ML", "M3",
 }
 
-# Na Tabela Bruta, a coluna "Unidade" refere-se a CONCENTRACAO (g/l, g/kg),
-# nao a unidade do volume comercializado. Essas unidades nao devem bloquear
-# o calculo de volumes ponderados.
 UNIDADES_CONCENTRACAO = {
     "G_L", "G/L", "GL", "G_KG", "G/KG", "GKG", "MG_L", "MG/L",
     "PERCENT", "PERCENTUAL", "%", "PPM", "PPB",
 }
 
+COLUNAS_NUMERICAS_COMERC = [
+    "ESTOQUE_INICIAL", "PRODUCAO_NACIONAL", "IMPORTACAO", "EXPORTACAO",
+    "VENDAS_INDUSTRIA", "VENDAS_CLIENTE", "VENDAS_TOTAIS", "ESTOQUE_FINAL",
+]
+
+MAPA_VOLUMES_PONDERADOS = {
+    "ESTOQUE_INICIAL": "ESTOQUE_INICIAL_PONDERADO_IA",
+    "PRODUCAO_NACIONAL": "PRODUCAO_NACIONAL_PONDERADA_IA",
+    "IMPORTACAO": "IMPORTACAO_PONDERADA_IA",
+    "EXPORTACAO": "EXPORTACAO_PONDERADA_IA",
+    "VENDAS_INDUSTRIA": "VENDAS_INDUSTRIA_PONDERADA_IA",
+    "VENDAS_CLIENTE": "VENDAS_CLIENTE_PONDERADA_IA",
+    "VENDAS_TOTAIS": "VENDA_PONDERADA_IA",
+    "ESTOQUE_FINAL": "ESTOQUE_FINAL_PONDERADO_IA",
+}
+
 LOGGER = logging.getLogger("agrofit_comercializacao")
 
-
 # =============================================================================
-# LOGGING E MENSAGENS DE PROGRESSO
+# LOGGING E MENSAGENS
 # =============================================================================
 
 class Cores:
@@ -200,7 +184,6 @@ def configurar_logging() -> None:
     caminho_log = LOGS_DIR / ARQUIVO_LOG
     LOGGER.setLevel(logging.DEBUG)
     LOGGER.handlers.clear()
-
     fh = logging.FileHandler(caminho_log, mode="a", encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(
@@ -246,8 +229,6 @@ def tempo_legivel(segundos: float) -> str:
 
 
 class Cronometro:
-    """Cronometro simples para medir e logar a duracao de cada etapa."""
-
     def __init__(self, nome: str):
         self.nome = nome
         self.inicio = None
@@ -268,7 +249,7 @@ class Cronometro:
 
 
 # =============================================================================
-# NORMALIZACAO DE TEXTO E NOMES DE COLUNA
+# NORMALIZACAO
 # =============================================================================
 
 def remover_acentos(texto: str) -> str:
@@ -279,15 +260,9 @@ def remover_acentos(texto: str) -> str:
 
 
 def normalizar_nome_coluna(nome: str) -> str:
-    """Padrao unico de nomes de coluna: MAIUSCULAS, SEM ACENTOS, SEM ESPACOS.
-
-    Trata cabecalhos tipicos da Tabela Bruta IBAMA/MAPA, incluindo tags HTML
-    de quebra de linha (ex.: 'Estoque<br>Inicial', 'Vendas a<br>Industria').
-    """
     if nome is None:
         return ""
     s = str(nome)
-    # Remove tags HTML / quebras embutidas nos cabecalhos do Excel
     s = re.sub(r"<br\s*/?>", " ", s, flags=re.IGNORECASE)
     s = s.replace("\n", " ").replace("\r", " ")
     s = remover_acentos(s).strip().upper()
@@ -297,8 +272,6 @@ def normalizar_nome_coluna(nome: str) -> str:
 
 
 def normalizar_texto_valor(valor: Any) -> Any:
-    """Normaliza um valor de texto para comparacoes (chaves de cruzamento),
-    mas NAO altera os dados exibidos no relatorio final."""
     if pd.isna(valor):
         return valor
     s = remover_acentos(str(valor)).strip().upper()
@@ -307,22 +280,13 @@ def normalizar_texto_valor(valor: Any) -> Any:
 
 
 def extrair_chave_registro(valor: Any) -> str:
-    """Normaliza NR_REGISTRO para uma chave comparavel: remove prefixos
-    (MAPA/IBAMA/ANVISA), sufixos alfanumericos comuns, pontuacao e zeros
-    a esquerda. Aceita formatos como 'MAPA-30320', '30320', 'IBAMA 001160',
-    '89-0816R', 'TC15022'."""
     if pd.isna(valor):
         return ""
     s = str(valor).strip().upper()
     s = remover_acentos(s)
-    # Remove prefixos institucionais e rotulos
     s = re.sub(r"^(MAPA|IBAMA|ANVISA|N[R°º]?\.?|REG(?:ISTRO)?|N[ºO]\.?)[\s\-/:]*", "", s)
-    # Mantem letras uteis de series (TC, R) apenas se vierem coladas ao numero;
-    # depois extrai bloco principal de digitos (com possivel letra intermediaria)
     s = s.replace(" ", "").replace("_", "").replace("/", "").replace("-", "")
-    # Extrai sequencia dominante de digitos (ignora letras finais tipo R)
     digitos = re.sub(r"[^0-9A-Z]", "", s)
-    # Se houver letras no meio (ex.: TC15022), remove letras e fica so digitos
     only_digits = re.sub(r"\D", "", digitos)
     if not only_digits:
         return ""
@@ -330,14 +294,10 @@ def extrair_chave_registro(valor: Any) -> str:
 
 
 def normalizar_ia(valor: Any) -> Any:
-    """Normaliza nome de ingrediente ativo para agregacao: minusculas,
-    sem acento, espacos colapsados. Preserva NaN."""
     if pd.isna(valor):
         return valor
     s = remover_acentos(str(valor)).strip().lower()
     s = re.sub(r"\s+", " ", s)
-    # Remove trechos de concentracao entre parenteses para casar melhor
-    # (ex.: "glifosato (480 g/l)" -> "glifosato") — so se sobrar texto util
     s_sem_paren = re.sub(r"\([^)]*\)", "", s).strip()
     if s_sem_paren:
         s = s_sem_paren
@@ -346,13 +306,8 @@ def normalizar_ia(valor: Any) -> Any:
 
 
 # =============================================================================
-# DICIONARIOS DE ALIASES DE COLUNA (mapeiam nomes "crus" -> nomes padronizados)
+# ALIASES DE COLUNA
 # =============================================================================
-# As chaves sao os nomes FINAIS padronizados (MAIUSCULAS_SEM_ACENTO_SEM_ESPACO).
-# Os valores sao listas de variantes conhecidas, ja normalizadas pela mesma
-# funcao normalizar_nome_coluna(), que podem aparecer nos arquivos de origem.
-# Se um arquivo novo trouxer uma variante nao mapeada, o programa registra um
-# aviso no log e mantem o nome original (normalizado) para nao perder dados.
 
 ALIASES_AGROFIT: Dict[str, List[str]] = {
     "NR_REGISTRO": ["NR_REGISTRO", "NUMERO_REGISTRO", "REGISTRO", "N_REGISTRO",
@@ -396,22 +351,11 @@ ALIASES_COMERC: Dict[str, List[str]] = {
     "PONDERACAO_IA": [
         "PONDERACAO_IA", "PONDERACAO", "PONDERACAO_PERCENT_IA_NO_PF",
         "PONDERACAO_DO_IA", "PERCENTUAL_IA", "PONDERACAO_IA_NO_PF",
-        "PONDERACAO_IA_NO_PF", "PONDERACAO_PERCENT_IA_NO_PF",
     ],
-    # Cabecalhos da Tabela Bruta (apos limpar <br>): Estoque Inicial, Producao Nacional,
-    # Importacao, Exportacao, Vendas a Industria, Vendas a Cliente, Estoque Final
-    "ESTOQUE_INICIAL": [
-        "ESTOQUE_INICIAL", "ESTOQUE_INICIAL_PF", "ESTOQUE_INI",
-    ],
-    "PRODUCAO_NACIONAL": [
-        "PRODUCAO_NACIONAL", "PRODUCAO", "PRODUCAO_NACIONAL_PF",
-    ],
-    "IMPORTACAO": [
-        "IMPORTACAO", "IMPORTACAO_PF", "IMPORTAC",
-    ],
-    "EXPORTACAO": [
-        "EXPORTACAO", "EXPORTACAO_PF", "EXPORTAC",
-    ],
+    "ESTOQUE_INICIAL": ["ESTOQUE_INICIAL", "ESTOQUE_INICIAL_PF", "ESTOQUE_INI"],
+    "PRODUCAO_NACIONAL": ["PRODUCAO_NACIONAL", "PRODUCAO", "PRODUCAO_NACIONAL_PF"],
+    "IMPORTACAO": ["IMPORTACAO", "IMPORTACAO_PF", "IMPORTAC"],
+    "EXPORTACAO": ["EXPORTACAO", "EXPORTACAO_PF", "EXPORTAC"],
     "VENDAS_INDUSTRIA": [
         "VENDAS_INDUSTRIA", "VENDA_INDUSTRIA", "VENDAS_A_INDUSTRIA",
         "VENDAS_INDUSTRIA_PF", "VENDAS_A_INDUSTRIA_PF", "VENDAS_INDUST",
@@ -424,9 +368,7 @@ ALIASES_COMERC: Dict[str, List[str]] = {
         "VENDAS_TOTAIS", "VENDA_TOTAL", "TOTAL_DE_VENDAS", "VENDAS",
         "VENDAS_PF_TOTAL", "VENDAS_TOTAIS_PF",
     ],
-    "ESTOQUE_FINAL": [
-        "ESTOQUE_FINAL", "ESTOQUE_FINAL_PF", "ESTOQUE_FIN",
-    ],
+    "ESTOQUE_FINAL": ["ESTOQUE_FINAL", "ESTOQUE_FINAL_PF", "ESTOQUE_FIN"],
     "ANO": ["ANO", "ANO_BASE", "ANO_REFERENCIA", "ANO_COMERCIALIZACAO"],
 }
 
@@ -434,18 +376,12 @@ ALIASES_COMERC: Dict[str, List[str]] = {
 def padronizar_colunas(
     df: pd.DataFrame, aliases: Dict[str, List[str]], origem: str = ""
 ) -> pd.DataFrame:
-    """Renomeia as colunas de df para o padrao definido em `aliases`.
-    Colunas nao mapeadas sao mantidas (apenas normalizadas) e reportadas
-    no log para acompanhamento."""
     df = df.copy()
     df.columns = [normalizar_nome_coluna(c) for c in df.columns]
-
-    # inverte o dicionario: variante -> nome padronizado
     mapa_reverso: Dict[str, str] = {}
     for padrao, variantes in aliases.items():
         for v in variantes:
             mapa_reverso[v] = padrao
-
     novas_colunas = {}
     nao_mapeadas = []
     for col in df.columns:
@@ -453,12 +389,9 @@ def padronizar_colunas(
             novas_colunas[col] = mapa_reverso[col]
         else:
             novas_colunas[col] = col
-            if col not in aliases:  # coluna nao reconhecida
+            if col not in aliases:
                 nao_mapeadas.append(col)
-
     df = df.rename(columns=novas_colunas)
-
-    # se o rename gerar colunas duplicadas, mantem a primeira nao-nula por linha
     if df.columns.duplicated().any():
         dup_names = df.columns[df.columns.duplicated()].unique().tolist()
         for nome in dup_names:
@@ -466,22 +399,19 @@ def padronizar_colunas(
             combinado = sub.bfill(axis=1).iloc[:, 0]
             df = df.loc[:, df.columns != nome]
             df[nome] = combinado
-
     if nao_mapeadas:
         LOGGER.info(
-            "Colunas nao mapeadas em %s (mantidas como estao): %s",
+            "Colunas nao mapeadas em %s (mantidas): %s",
             origem, ", ".join(sorted(set(nao_mapeadas))),
         )
     return df
 
 
 # =============================================================================
-# CONVERSAO NUMERICA (padrao brasileiro: 1.234,56 -> 1234.56)
+# CONVERSAO NUMERICA
 # =============================================================================
 
 def converter_numero_br(serie: pd.Series) -> pd.Series:
-    """Converte uma serie (texto ou numero) para float, tratando o padrao
-    brasileiro de separador decimal (virgula) e milhar (ponto)."""
     if serie is None:
         return serie
     if pd.api.types.is_numeric_dtype(serie):
@@ -498,7 +428,6 @@ def converter_numero_br(serie: pd.Series) -> pd.Series:
         s = re.sub(r"[^\d,.\-]", "", s)
         if s == "":
             return np.nan
-        # se tem ambos separadores, o ultimo encontrado eh o decimal
         if "," in s and "." in s:
             if s.rfind(",") > s.rfind("."):
                 s = s.replace(".", "").replace(",", ".")
@@ -515,8 +444,6 @@ def converter_numero_br(serie: pd.Series) -> pd.Series:
 
 
 def converter_percentual(serie: pd.Series) -> pd.Series:
-    """Converte coluna de ponderacao/percentual para fracao entre 0 e 1.
-    Aceita '50%', '50', '0,5', 0.5, 50 -> todos viram 0.5."""
     valores = converter_numero_br(serie)
 
     def _norm(v):
@@ -533,7 +460,7 @@ def converter_percentual(serie: pd.Series) -> pd.Series:
 
 
 # =============================================================================
-# CARGA: BASE AGROFIT
+# CARGA AGROFIT
 # =============================================================================
 
 def localizar_arquivo_agrofit() -> Optional[Path]:
@@ -548,7 +475,6 @@ def localizar_arquivo_agrofit() -> Optional[Path]:
 
 
 def _ler_csv_robusto(caminho: Path) -> pd.DataFrame:
-    """Tenta combinacoes comuns de separador/encoding de arquivos .gov.br."""
     tentativas = [
         dict(sep=";", encoding="utf-8-sig"),
         dict(sep=";", encoding="latin1"),
@@ -562,7 +488,7 @@ def _ler_csv_robusto(caminho: Path) -> pd.DataFrame:
             df = pd.read_csv(caminho, dtype=str, low_memory=False, **opcoes)
             if df.shape[1] > 1:
                 return df
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             ultimo_erro = e
             continue
     raise RuntimeError(f"Nao foi possivel ler o CSV {caminho.name}: {ultimo_erro}")
@@ -572,46 +498,39 @@ def carregar_agrofit(caminho: Path) -> pd.DataFrame:
     df = _ler_csv_robusto(caminho)
     linhas_brutas = len(df)
     df = padronizar_colunas(df, ALIASES_AGROFIT, origem=f"Agrofit ({caminho.name})")
-
     for col in ["NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO", "CULTURA",
                 "PRAGA_NOME_CIENTIFICO", "PRAGA_NOME_COMUM", "TITULAR_DE_REGISTRO",
                 "FORMULACAO", "SITUACAO"]:
         if col not in df.columns:
             df[col] = np.nan
-            aviso(f"Coluna esperada do Agrofit ausente no arquivo: {col}")
-
+            aviso(f"Coluna esperada do Agrofit ausente: {col}")
     df["NR_REGISTRO"] = df["NR_REGISTRO"].astype(str).str.strip()
     df["_CHAVE_REGISTRO"] = df["NR_REGISTRO"].apply(extrair_chave_registro)
     df = df[df["_CHAVE_REGISTRO"] != ""]
-
     LOGGER.info(
-        "Agrofit carregado: %s linhas brutas, %s linhas validas, %s registros unicos",
+        "Agrofit: %s linhas brutas, %s validas, %s registros unicos",
         linhas_brutas, len(df), df["_CHAVE_REGISTRO"].nunique(),
     )
     return df
 
 
 # =============================================================================
-# CARGA: BASES DE COMERCIALIZACAO (multiplos anos)
+# CARGA COMERCIALIZACAO
 # =============================================================================
 
-PADRAO_ANO = re.compile(r"(19|20)\d{2}")
+PADRAO_ANO = re.compile(r"(?:19|20)\d{2}")
 
 
 def extrair_ano_do_nome(nome_arquivo: str) -> Optional[int]:
-    achados = PADRAO_ANO.findall(nome_arquivo)
-    # findall com grupo retorna so o prefixo; refazer busca sem grupo de captura
     achados = re.findall(r"(?:19|20)\d{2}", nome_arquivo)
     if not achados:
         return None
-    # se houver mais de um numero de 4 digitos, usa o ultimo (mais provavel de ser o ano)
     return int(achados[-1])
 
 
 def detectar_arquivos_comercializacao(caminho_agrofit: Optional[Path]) -> List[Path]:
-    extensoes = ["*.xlsx", "*.xls", "*.csv"]
     candidatos: List[Path] = []
-    for ext in extensoes:
+    for ext in ["*.xlsx", "*.xls", "*.csv"]:
         candidatos.extend(DADOS_DIR.glob(ext))
     candidatos = [
         c for c in candidatos
@@ -622,8 +541,6 @@ def detectar_arquivos_comercializacao(caminho_agrofit: Optional[Path]) -> List[P
 
 
 def _escolher_aba_excel(caminho: Path) -> Optional[str]:
-    """Escolhe a aba mais provavel de conter os dados de comercializacao
-    (evita abas de metadados/instrucoes quando houver mais de uma)."""
     try:
         xls = pd.ExcelFile(caminho)
     except Exception:
@@ -636,23 +553,19 @@ def _escolher_aba_excel(caminho: Path) -> Optional[str]:
         for aba in abas:
             if pista in remover_acentos(aba).upper().replace(" ", "_"):
                 return aba
-    # senao, escolhe a aba com mais linhas
-    melhor_aba, melhor_linhas = abas[0], -1
+    melhor_aba, melhor_cols = abas[0], -1
     for aba in abas:
         try:
-            n = pd.read_excel(caminho, sheet_name=aba, nrows=0).shape[1]
             df_teste = pd.read_excel(caminho, sheet_name=aba, nrows=5)
-            if df_teste.shape[1] > melhor_linhas:
-                melhor_linhas = df_teste.shape[1]
+            if df_teste.shape[1] > melhor_cols:
+                melhor_cols = df_teste.shape[1]
                 melhor_aba = aba
         except Exception:
             continue
     return melhor_aba
 
 
-
 def _limpar_cabecalho_tabela_bruta(nome: str) -> str:
-    """Limpa tags <br> e espacos de cabecalhos da Tabela Bruta IBAMA/MAPA."""
     if nome is None:
         return ""
     s = str(nome).replace("\xa0", " ").strip()
@@ -662,34 +575,14 @@ def _limpar_cabecalho_tabela_bruta(nome: str) -> str:
 
 
 def _mapear_colunas_tabela_bruta(df: pd.DataFrame) -> pd.DataFrame:
-    """Mapeia explicitamente a estrutura da Tabela Bruta de Comercializacao.
-
-    Layout tipico (aba TODOS_Agrotóxicos):
-      [metadados] ... Classificacao Ambiental PT |
-      BLOCO PF (produto formulado / original):
-        Estoque Inicial, Producao Nacional, Importacao, Exportacao,
-        Vendas a Industria, Vendas a Cliente, Estoque Final, RO..DF
-      Linha | Ponderacao (% IA no PF) |
-      BLOCO IA (ja ponderado na planilha de origem; pandas sufixa .1):
-        Estoque Inicial.1, ... Vendas a Cliente.1, Vendas Totais, Estoque Final.1,
-        RO.1..DF.1, Total UF, Brasil
-
-    - Colunas do BLOCO PF viram ESTOQUE_INICIAL, VENDAS_INDUSTRIA, ... (originais)
-    - Colunas do BLOCO IA viram ESTOQUE_INICIAL_PONDERADO_IA, ... e tambem
-      alimentam VENDA_PONDERADA_IA a partir de 'Vendas Totais' / 'Brasil'
-    - VENDAS_TOTAIS (original) = Vendas a Industria + Vendas a Cliente do bloco PF
-    """
+    """Mapeia a estrutura da Tabela Bruta IBAMA/MAPA (bloco PF + bloco IA)."""
     df = df.copy()
-    # Limpa nomes
     df.columns = [_limpar_cabecalho_tabela_bruta(c) for c in df.columns]
-    # Descarta colunas vazias / so espaco
     df = df.loc[:, [c for c in df.columns if c and not str(c).startswith("Unnamed")]]
 
-    # Mapa posicional por nome limpo (primeira ocorrencia = PF, .1 = IA)
     rename: Dict[str, str] = {}
     cols = list(df.columns)
 
-    # Metadados
     meta = {
         "Detentor": "DETENTOR",
         "Marca comercial": "MARCA_COMERCIAL",
@@ -708,17 +601,15 @@ def _mapear_colunas_tabela_bruta(df: pd.DataFrame) -> pd.DataFrame:
         "Densidade": "DENSIDADE",
         "Total UF": "TOTAL_UF_IA",
         "Brasil": "BRASIL_IA",
-        "Vendas Totais": "VENDAS_TOTAIS_IA_ORIGEM",  # ja e IA na planilha
+        "Vendas Totais": "VENDAS_TOTAIS_IA_ORIGEM",
     }
     for c in cols:
         if c in meta:
             rename[c] = meta[c]
-        # variante sem acento apos limpeza parcial
         c_sem = remover_acentos(c)
         if c_sem in meta and c not in rename:
             rename[c] = meta[c_sem]
 
-    # Volumes PF (sem sufixo .1)
     pf_map = {
         "Estoque Inicial": "ESTOQUE_INICIAL",
         "Producao Nacional": "PRODUCAO_NACIONAL",
@@ -732,7 +623,6 @@ def _mapear_colunas_tabela_bruta(df: pd.DataFrame) -> pd.DataFrame:
         "Vendas a Cliente": "VENDAS_CLIENTE",
         "Estoque Final": "ESTOQUE_FINAL",
     }
-    # Volumes IA (sufixo .1 do pandas)
     ia_map = {
         "Estoque Inicial.1": "ESTOQUE_INICIAL_PONDERADO_IA",
         "Producao Nacional.1": "PRODUCAO_NACIONAL_PONDERADA_IA",
@@ -753,16 +643,12 @@ def _mapear_colunas_tabela_bruta(df: pd.DataFrame) -> pd.DataFrame:
         elif c in ia_map:
             rename[c] = ia_map[c]
         else:
-            # UF do bloco PF (sigla pura)
             if c in UFS:
-                rename[c] = c  # mantem UF para formato longo PF
-            # UF do bloco IA
+                rename[c] = c
             elif c.endswith(".1") and c[:-2] in UFS:
                 rename[c] = f"UF_{c[:-2]}_IA"
 
     df = df.rename(columns=rename)
-
-    # Se ainda houver colunas duplicadas apos rename, combina
     if df.columns.duplicated().any():
         dup_names = df.columns[df.columns.duplicated()].unique().tolist()
         for nome in dup_names:
@@ -770,7 +656,6 @@ def _mapear_colunas_tabela_bruta(df: pd.DataFrame) -> pd.DataFrame:
             combinado = sub.bfill(axis=1).iloc[:, 0]
             df = df.loc[:, df.columns != nome]
             df[nome] = combinado
-
     return df
 
 
@@ -783,16 +668,14 @@ def carregar_arquivo_comercializacao(caminho: Path) -> pd.DataFrame:
     else:
         aba = _escolher_aba_excel(caminho)
         df = pd.read_excel(caminho, sheet_name=aba, dtype=str)
-        # Detecta Tabela Bruta (colunas com <br> ou Ponderacao / Vendas Totais + Brasil)
         cols_raw = [str(c) for c in df.columns]
         is_tabela_bruta = any(
             ("<br>" in c) or ("Pondera" in c) or (c.strip() == "Brasil")
             for c in cols_raw
         )
         if is_tabela_bruta:
-            LOGGER.info("Formato Tabela Bruta detectado em %s (aba=%s)", caminho.name, aba)
+            LOGGER.info("Tabela Bruta detectada em %s (aba=%s)", caminho.name, aba)
             df = _mapear_colunas_tabela_bruta(df)
-            # Garante nomes padronizados restantes via aliases (sem sobrescrever ja mapeados)
             df = padronizar_colunas(df, ALIASES_COMERC, origem=f"Comercializacao/TB ({caminho.name})")
         else:
             df = padronizar_colunas(df, ALIASES_COMERC, origem=f"Comercializacao ({caminho.name})")
@@ -804,23 +687,21 @@ def carregar_arquivo_comercializacao(caminho: Path) -> pd.DataFrame:
     elif ano_detectado is not None:
         df["ANO"] = ano_detectado
     else:
-        aviso(f"Nao foi possivel identificar o ANO do arquivo {caminho.name}; linhas descartadas para fins de serie historica.")
+        aviso(f"ANO nao identificado em {caminho.name}; linhas sem serie historica.")
         df["ANO"] = np.nan
 
     df["_ARQUIVO_ORIGEM"] = caminho.name
 
     if "NR_REGISTRO" not in df.columns:
-        # tentativa final: qualquer coluna que contenha "REGISTRO" e nao seja
-        # claramente outra coisa (situacao, titular, detentor, data)
         candidatas = [
             c for c in df.columns
             if "REGISTRO" in c and not any(p in c for p in ["SITUACAO", "TITULAR", "DETENTOR", "DATA"])
         ]
         if candidatas:
             df = df.rename(columns={candidatas[0]: "NR_REGISTRO"})
-            LOGGER.info("Coluna '%s' assumida como NR_REGISTRO em %s (correspondencia aproximada).", candidatas[0], caminho.name)
+            LOGGER.info("Coluna '%s' assumida como NR_REGISTRO em %s.", candidatas[0], caminho.name)
         else:
-            aviso(f"Arquivo {caminho.name} nao possui coluna de NR_REGISTRO identificavel; sera ignorado.")
+            aviso(f"{caminho.name} sem NR_REGISTRO identificavel; ignorado.")
             return pd.DataFrame()
 
     df["NR_REGISTRO"] = df["NR_REGISTRO"].astype(str).str.strip()
@@ -828,7 +709,7 @@ def carregar_arquivo_comercializacao(caminho: Path) -> pd.DataFrame:
     df = df[df["_CHAVE_REGISTRO"] != ""]
 
     LOGGER.info(
-        "Arquivo de comercializacao carregado: %s | linhas=%s | ano=%s",
+        "Comercializacao: %s | linhas=%s | anos=%s",
         caminho.name, len(df), sorted(df["ANO"].dropna().unique().tolist()),
     )
     return df
@@ -843,27 +724,18 @@ def carregar_todas_comercializacoes(arquivos: List[Path]) -> pd.DataFrame:
                 partes.append(df)
                 ok(f"Processado: {caminho.name} ({len(df):,} linhas)")
             else:
-                aviso(f"Arquivo ignorado (sem dados aproveitaveis): {caminho.name}")
-        except Exception as e:  # noqa: BLE001
+                aviso(f"Arquivo ignorado (sem dados): {caminho.name}")
+        except Exception as e:
             erro(f"Falha ao processar {caminho.name}: {e}")
-            LOGGER.error("Falha ao processar %s: %s\n%s", caminho.name, e, traceback.format_exc())
-
+            LOGGER.error("Falha %s: %s\n%s", caminho.name, e, traceback.format_exc())
     if not partes:
         return pd.DataFrame()
-
-    df_final = pd.concat(partes, ignore_index=True, sort=False)
-    return df_final
+    return pd.concat(partes, ignore_index=True, sort=False)
 
 
 # =============================================================================
-# PREPARACAO NUMERICA DAS COLUNAS DE COMERCIALIZACAO
+# PREPARACAO NUMERICA E PONDERACAO IA
 # =============================================================================
-
-COLUNAS_NUMERICAS_COMERC = [
-    "ESTOQUE_INICIAL", "PRODUCAO_NACIONAL", "IMPORTACAO", "EXPORTACAO",
-    "VENDAS_INDUSTRIA", "VENDAS_CLIENTE", "VENDAS_TOTAIS", "ESTOQUE_FINAL",
-]
-
 
 def preparar_numericos_comercializacao(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -873,7 +745,6 @@ def preparar_numericos_comercializacao(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df[col] = np.nan
 
-    # Converte tambem colunas ja ponderadas vindas da Tabela Bruta e auxiliares
     extras_num = [
         "PONDERACAO_IA", "VENDAS_TOTAIS_IA_ORIGEM", "BRASIL_IA", "TOTAL_UF_IA",
         "CONCENTRACAO", "DENSIDADE",
@@ -888,17 +759,11 @@ def preparar_numericos_comercializacao(df: pd.DataFrame) -> pd.DataFrame:
     if "PONDERACAO_IA" not in df.columns:
         df["PONDERACAO_IA"] = np.nan
 
-    # VENDAS_TOTAIS ORIGINAL = produto formulado (industria + cliente).
-    # Na Tabela Bruta nao existe "Vendas Totais" no bloco PF — so no bloco IA.
     soma_ind_cli = df[["VENDAS_INDUSTRIA", "VENDAS_CLIENTE"]].sum(axis=1, min_count=1)
     if "VENDAS_TOTAIS" not in df.columns or df["VENDAS_TOTAIS"].isna().all():
         df["VENDAS_TOTAIS"] = soma_ind_cli
     else:
-        # Nao usar Vendas Totais do bloco IA como original
-        df["VENDAS_TOTAIS"] = df["VENDAS_TOTAIS"].where(
-            df["VENDAS_TOTAIS"].notna(), soma_ind_cli
-        )
-        # Se VENDAS_TOTAIS veio mapeado de "Vendas Totais" (IA), prefere soma PF
+        df["VENDAS_TOTAIS"] = df["VENDAS_TOTAIS"].where(df["VENDAS_TOTAIS"].notna(), soma_ind_cli)
         if "VENDAS_TOTAIS_IA_ORIGEM" in df.columns:
             df["VENDAS_TOTAIS"] = soma_ind_cli
 
@@ -907,45 +772,14 @@ def preparar_numericos_comercializacao(df: pd.DataFrame) -> pd.DataFrame:
     df["_UNIDADE_NORM"] = df["UNIDADE"].apply(
         lambda v: normalizar_texto_valor(v) if pd.notna(v) else np.nan
     )
-
     return df
 
 
-# Colunas de volume da planilha de comercializacao (produto formulado / original)
-# e os nomes das respectivas colunas ponderadas pelo teor de IA.
-MAPA_VOLUMES_PONDERADOS = {
-    "ESTOQUE_INICIAL": "ESTOQUE_INICIAL_PONDERADO_IA",
-    "PRODUCAO_NACIONAL": "PRODUCAO_NACIONAL_PONDERADA_IA",
-    "IMPORTACAO": "IMPORTACAO_PONDERADA_IA",
-    "EXPORTACAO": "EXPORTACAO_PONDERADA_IA",
-    "VENDAS_INDUSTRIA": "VENDAS_INDUSTRIA_PONDERADA_IA",
-    "VENDAS_CLIENTE": "VENDAS_CLIENTE_PONDERADA_IA",
-    "VENDAS_TOTAIS": "VENDA_PONDERADA_IA",  # alias principal de vendas ponderadas
-    "ESTOQUE_FINAL": "ESTOQUE_FINAL_PONDERADO_IA",
-}
-
-
 def calcular_venda_estimada_ia(df: pd.DataFrame) -> pd.DataFrame:
-    """Preserva volumes ORIGINAIS e cria colunas PONDERADAS pelo teor de IA.
-
-    Para cada coluna de volume da planilha (Estoque Inicial, Producao Nacional,
-    Importacao, Exportacao, Vendas a Industria, Vendas a Cliente, Vendas Totais,
-    Estoque Final):
-
-      coluna_original  -> permanece intacta (auditoria)
-      coluna_ponderada = coluna_original * PONDERACAO_IA  (quantidade efetiva de IA)
-
-    VENDA_PONDERADA_IA e VENDA_ESTIMADA_IA sao aliases de VENDAS_TOTAIS * teor.
-    STATUS_CALCULO_IA indica se o ponderado foi calculado ou o motivo da falha.
-    Nunca sobrescreve colunas originais.
-    """
+    """Preserva volumes ORIGINAIS e cria colunas PONDERADAS (PF x teor IA)."""
     df = df.copy()
 
-    tem_ponderacao = "PONDERACAO_IA" in df.columns and df["PONDERACAO_IA"].notna().any()
-    tem_vendas = "VENDAS_TOTAIS" in df.columns
-
     def _status(row):
-        # Status baseado principalmente em vendas totais (metrica central)
         vendas = row.get("VENDAS_TOTAIS", np.nan)
         if pd.isna(vendas) and all(
             pd.isna(row.get(c, np.nan)) for c in COLUNAS_NUMERICAS_COMERC if c != "VENDAS_TOTAIS"
@@ -956,13 +790,11 @@ def calcular_venda_estimada_ia(df: pd.DataFrame) -> pd.DataFrame:
         unidade = row.get("_UNIDADE_NORM")
         if pd.notna(unidade):
             u = str(unidade).replace("/", "_").replace(" ", "_")
-            # Unidade de concentracao (g/l, g/kg) da Tabela Bruta: nao bloqueia
             if u in UNIDADES_CONCENTRACAO or any(
                 u.startswith(p) or u.endswith(p) for p in ("G_L", "G_KG", "MG_L")
             ):
                 return "CALCULADO"
             if u not in UNIDADES_COMPATIVEIS and u not in {"", "NAN"}:
-                # Unidades de contagem (UN, PC, CX...) sao incompativeis para massa/volume
                 if u in {"UN", "UND", "UNIDADE", "PC", "PÇ", "CX", "FR", "SC", "DOSE"}:
                     return "UNIDADE_INCOMPATIVEL"
         return "CALCULADO"
@@ -973,9 +805,7 @@ def calcular_venda_estimada_ia(df: pd.DataFrame) -> pd.DataFrame:
     for col_orig, col_pond in MAPA_VOLUMES_PONDERADOS.items():
         if col_orig not in df.columns:
             df[col_orig] = np.nan
-        # Prefer values already present from Tabela Bruta (bloco IA)
         if col_pond in df.columns and df[col_pond].notna().any():
-            # Completa lacunas com calculo PF * ponderacao
             calculado = np.where(
                 pode_calcular & df[col_orig].notna(),
                 df[col_orig] * df["PONDERACAO_IA"],
@@ -989,7 +819,6 @@ def calcular_venda_estimada_ia(df: pd.DataFrame) -> pd.DataFrame:
                 np.nan,
             )
 
-    # Venda ponderada: prefere Vendas Totais / Brasil da planilha (ja em IA)
     if "VENDAS_TOTAIS_IA_ORIGEM" in df.columns and df["VENDAS_TOTAIS_IA_ORIGEM"].notna().any():
         df["VENDA_PONDERADA_IA"] = df["VENDAS_TOTAIS_IA_ORIGEM"].where(
             df["VENDAS_TOTAIS_IA_ORIGEM"].notna(),
@@ -1011,28 +840,22 @@ def calcular_venda_estimada_ia(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# NORMALIZACAO DAS COLUNAS DE UF (27 colunas -> formato longo)
+# UF LONGO
 # =============================================================================
 
 def identificar_colunas_uf(df: pd.DataFrame) -> List[str]:
-    """Localiza quais das 27 siglas de UF existem como colunas no dataframe."""
-    presentes = [uf for uf in UFS if uf in df.columns]
-    return presentes
+    return [uf for uf in UFS if uf in df.columns]
 
 
 def montar_venda_para_uf_longo(
     df_vendas_bruto: pd.DataFrame, colunas_id: List[str]
 ) -> pd.DataFrame:
-    """Transforma as colunas de UF (uma por estado) em formato longo:
-    NR_REGISTRO | ANO | UF | REGIAO | VENDA."""
     colunas_uf = identificar_colunas_uf(df_vendas_bruto)
     if not colunas_uf:
         return pd.DataFrame(columns=["NR_REGISTRO", "ANO", "UF", "REGIAO", "VENDA"])
-
     df = df_vendas_bruto.copy()
     for uf in colunas_uf:
         df[uf] = converter_numero_br(df[uf])
-
     cols_manter = [c for c in colunas_id if c in df.columns] + colunas_uf
     df_long = df[cols_manter].melt(
         id_vars=[c for c in colunas_id if c in df.columns],
@@ -1045,53 +868,9 @@ def montar_venda_para_uf_longo(
     return df_long
 
 
-# =============================================================================
-# CONSTRUCAO DAS TABELAS ANALITICAS
-# =============================================================================
-
-# ---------- Tabela 1: Produtos (1 linha = 1 registro/produto) ----------
-def montar_tabela_produtos(df_agrofit: pd.DataFrame) -> pd.DataFrame:
-    colunas = [
-        "NR_REGISTRO", "MARCA_COMERCIAL", "FORMULACAO", "INGREDIENTE_ATIVO",
-        "TITULAR_DE_REGISTRO", "CLASSE", "MODO_DE_ACAO", "EMPRESA_PAIS_TIPO",
-        "CLASSE_TOXICOLOGICA", "CLASSE_AMBIENTAL", "ORGANICOS", "SITUACAO",
-    ]
-    presentes = [c for c in colunas if c in df_agrofit.columns]
-
-    def _juntar_unicos(serie: pd.Series) -> str:
-        vals = [str(v).strip() for v in serie.dropna().unique() if str(v).strip()]
-        return "; ".join(sorted(set(vals)))
-
-    agregadores = {}
-    for c in presentes:
-        if c == "NR_REGISTRO":
-            continue
-        if c in ("INGREDIENTE_ATIVO", "CULTURA"):
-            agregadores[c] = _juntar_unicos
-        else:
-            agregadores[c] = "first"
-
-    df = df_agrofit.copy()
-    df_prod = df.groupby(["_CHAVE_REGISTRO", "NR_REGISTRO"], as_index=False).agg(agregadores)
-    df_prod = df_prod.drop_duplicates(subset=["_CHAVE_REGISTRO"]).reset_index(drop=True)
-    return df_prod
-
-
-# ---------- Tabela 2: Agrofit_Uso (1 linha = Registro x Cultura x Praga) ----------
-def montar_tabela_agrofit_uso(df_agrofit: pd.DataFrame) -> pd.DataFrame:
-    colunas = [
-        "NR_REGISTRO", "_CHAVE_REGISTRO", "CULTURA", "PRAGA_NOME_CIENTIFICO",
-        "PRAGA_NOME_COMUM", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO", "FORMULACAO",
-    ]
-    presentes = [c for c in colunas if c in df_agrofit.columns]
-    df_uso = df_agrofit[presentes].drop_duplicates().reset_index(drop=True)
-    return df_uso
-
-
 def _enriquecer_com_agrofit(
     df: pd.DataFrame, df_produtos: pd.DataFrame, campos: Optional[List[str]] = None
 ) -> pd.DataFrame:
-    """Preenche campos de identificacao ausentes com dados do Agrofit (nao toca volumes)."""
     if df.empty or df_produtos.empty:
         return df
     if campos is None:
@@ -1115,18 +894,87 @@ def _enriquecer_com_agrofit(
     return out
 
 
-# ---------- Tabela 3: Comercializacao_Produto (1 linha = Registro x Ano) ----------
-# Perspectiva PRODUTO: consolida multi-IA em uma linha. Somente volumes de
-# produto formulado (PF). Colunas ponderadas de IA NAO entram aqui — use
-# 04_Comerc_IA / 06_IA_Anual para analise por ingrediente ativo.
-def montar_comercializacao_produto(
-    df_vendas: pd.DataFrame, df_produtos: pd.DataFrame
+def _juntar_unicos(serie: pd.Series) -> str:
+    vals = [str(v).strip() for v in serie.dropna().unique() if str(v).strip()]
+    return "; ".join(sorted(set(vals))) if vals else np.nan
+
+
+# =============================================================================
+# 01 - RESUMO AGROFIT (dimensao produto)
+# =============================================================================
+
+def montar_resumo_agrofit(df_agrofit: pd.DataFrame) -> pd.DataFrame:
+    """1 linha por registro MAPA: cadastro Agrofit + contagens de uso."""
+    if df_agrofit.empty:
+        return pd.DataFrame()
+
+    colunas_attr = [
+        "NR_REGISTRO", "MARCA_COMERCIAL", "FORMULACAO", "INGREDIENTE_ATIVO",
+        "TITULAR_DE_REGISTRO", "CLASSE", "MODO_DE_ACAO", "EMPRESA_PAIS_TIPO",
+        "CLASSE_TOXICOLOGICA", "CLASSE_AMBIENTAL", "ORGANICOS", "SITUACAO",
+    ]
+    presentes = [c for c in colunas_attr if c in df_agrofit.columns]
+
+    agregadores: Dict[str, Any] = {}
+    for c in presentes:
+        if c == "NR_REGISTRO":
+            continue
+        if c == "INGREDIENTE_ATIVO":
+            agregadores[c] = _juntar_unicos
+        else:
+            agregadores[c] = "first"
+
+    df = df_agrofit.copy()
+    df_prod = df.groupby(["_CHAVE_REGISTRO", "NR_REGISTRO"], as_index=False).agg(agregadores)
+    df_prod = df_prod.drop_duplicates(subset=["_CHAVE_REGISTRO"]).reset_index(drop=True)
+
+    # Contagens de uso
+    if "CULTURA" in df.columns:
+        uso_c = df.groupby("_CHAVE_REGISTRO")["CULTURA"].nunique().rename("NUM_CULTURAS")
+        df_prod = df_prod.merge(uso_c, on="_CHAVE_REGISTRO", how="left")
+    else:
+        df_prod["NUM_CULTURAS"] = 0
+
+    if "PRAGA_NOME_CIENTIFICO" in df.columns:
+        uso_p = df.groupby("_CHAVE_REGISTRO")["PRAGA_NOME_CIENTIFICO"].nunique().rename("NUM_PRAGAS")
+        df_prod = df_prod.merge(uso_p, on="_CHAVE_REGISTRO", how="left")
+    else:
+        df_prod["NUM_PRAGAS"] = 0
+
+    df_prod["NUM_CULTURAS"] = df_prod["NUM_CULTURAS"].fillna(0).astype(int)
+    df_prod["NUM_PRAGAS"] = df_prod["NUM_PRAGAS"].fillna(0).astype(int)
+
+    # Principais culturas / pragas (resumo textual limitado)
+    if "CULTURA" in df.columns:
+        def _top_culturas(s):
+            vals = [str(v).strip() for v in s.dropna() if str(v).strip()]
+            unicos = sorted(set(vals))[:15]
+            return "; ".join(unicos) if unicos else np.nan
+        cult = df.groupby("_CHAVE_REGISTRO")["CULTURA"].agg(_top_culturas).rename("PRINCIPAIS_CULTURAS")
+        df_prod = df_prod.merge(cult, on="_CHAVE_REGISTRO", how="left")
+
+    if "PRAGA_NOME_COMUM" in df.columns:
+        def _top_pragas(s):
+            vals = [str(v).strip() for v in s.dropna() if str(v).strip()]
+            unicos = sorted(set(vals))[:15]
+            return "; ".join(unicos) if unicos else np.nan
+        prag = df.groupby("_CHAVE_REGISTRO")["PRAGA_NOME_COMUM"].agg(_top_pragas).rename("PRINCIPAIS_PRAGAS")
+        df_prod = df_prod.merge(prag, on="_CHAVE_REGISTRO", how="left")
+
+    return df_prod
+
+
+# =============================================================================
+# 02 - COMERCIALIZACAO_PRODUTOS (Registro x Ano, volumes PF)
+# =============================================================================
+
+def montar_comercializacao_produtos(
+    df_vendas: pd.DataFrame, df_resumo_agrofit: pd.DataFrame
 ) -> pd.DataFrame:
+    """1 linha = Registro x Ano. Volumes PF originais. Multi-IA: first/max (nao soma)."""
     if df_vendas.empty:
         return pd.DataFrame()
 
-    # Volumes ja devem estar numericos (preparar_numericos no main).
-    # Nao calcula nem expõe colunas ponderadas de IA nesta aba.
     df = df_vendas.copy()
     for col in COLUNAS_NUMERICAS_COMERC:
         if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
@@ -1144,70 +992,106 @@ def montar_comercializacao_produto(
         ] if c in df.columns
     ]
 
+    # first nos volumes PF: multi-IA repete o mesmo volume — nao somar
     agregadores: Dict[str, Any] = {c: "first" for c in campos_volume_pf}
     agregadores.update({c: "first" for c in campos_primeiro})
     if "INGREDIENTE_ATIVO" in df.columns:
-        def _join_ias(s):
-            vals = sorted({str(v).strip() for v in s.dropna() if str(v).strip()})
-            return "; ".join(vals) if vals else np.nan
-        agregadores["INGREDIENTE_ATIVO"] = _join_ias
+        agregadores["INGREDIENTE_ATIVO"] = _juntar_unicos
     if "CONCENTRACAO" in df.columns:
-        def _join_conc(s):
-            vals = [str(v).strip() for v in s.dropna() if str(v).strip()]
-            return "; ".join(vals) if vals else np.nan
-        agregadores["CONCENTRACAO"] = _join_conc
+        agregadores["CONCENTRACAO"] = _juntar_unicos
+    if "PONDERACAO_IA" in df.columns:
+        agregadores["PONDERACAO_IA"] = _juntar_unicos
     if "NR_REGISTRO" in df.columns:
         agregadores["NR_REGISTRO"] = "first"
+    agregadores["NUM_LINHAS_ORIGEM"] = ("_CHAVE_REGISTRO", "size")
 
     group_keys = ["_CHAVE_REGISTRO", "ANO"]
-    if "NR_REGISTRO" not in agregadores and "NR_REGISTRO" in df.columns:
-        group_keys = ["_CHAVE_REGISTRO", "NR_REGISTRO", "ANO"]
+    df_anual = df.groupby(group_keys, as_index=False).agg(
+        **{k: v if isinstance(v, tuple) else (k, v) for k, v in {
+            **{c: (c, "first") for c in campos_volume_pf},
+            **{c: (c, "first") for c in campos_primeiro},
+            **({"INGREDIENTE_ATIVO": ("INGREDIENTE_ATIVO", _juntar_unicos)} if "INGREDIENTE_ATIVO" in df.columns else {}),
+            **({"CONCENTRACAO": ("CONCENTRACAO", _juntar_unicos)} if "CONCENTRACAO" in df.columns else {}),
+            **({"NR_REGISTRO": ("NR_REGISTRO", "first")} if "NR_REGISTRO" in df.columns else {}),
+            "NUM_LINHAS_ORIGEM": ("_CHAVE_REGISTRO", "size"),
+        }.items()}
+    )
 
-    df_anual = df.groupby(group_keys, as_index=False).agg(agregadores)
-
-    df_anual = _enriquecer_com_agrofit(df_anual, df_produtos)
+    df_anual = _enriquecer_com_agrofit(df_anual, df_resumo_agrofit)
     if "DETENTOR" not in df_anual.columns:
         df_anual["DETENTOR"] = np.nan
     if "INGREDIENTE_ATIVO" in df_anual.columns:
         df_anual["NUM_IAS"] = df_anual["INGREDIENTE_ATIVO"].apply(
             lambda v: len([x for x in str(v).split(";") if x.strip()]) if pd.notna(v) else 0
         )
+    else:
+        df_anual["NUM_IAS"] = 0
 
     colunas_finais = [
         "NR_REGISTRO", "ANO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO", "NUM_IAS",
-        "DETENTOR", "PRODUTO_TECNICO", "CONCENTRACAO", "UNIDADE", "CLASSES_USO",
-        # Somente volumes de produto formulado (auditoria / analise de produto)
+        "CONCENTRACAO", "DETENTOR", "PRODUTO_TECNICO", "UNIDADE", "CLASSES_USO",
         "ESTOQUE_INICIAL", "PRODUCAO_NACIONAL", "IMPORTACAO", "EXPORTACAO",
         "VENDAS_INDUSTRIA", "VENDAS_CLIENTE", "VENDAS_TOTAIS", "ESTOQUE_FINAL",
-        "_CHAVE_REGISTRO",
+        "NUM_LINHAS_ORIGEM", "_CHAVE_REGISTRO",
     ]
     colunas_finais = [c for c in colunas_finais if c in df_anual.columns]
     return df_anual[colunas_finais].sort_values(["NR_REGISTRO", "ANO"]).reset_index(drop=True)
 
 
-# Alias legado usado internamente por funcoes que ainda esperam o nome antigo
-def montar_comercializacao_anual(
-    df_vendas: pd.DataFrame, df_produtos: pd.DataFrame
-) -> pd.DataFrame:
-    return montar_comercializacao_produto(df_vendas, df_produtos)
+# =============================================================================
+# 03 - EVOLUCAO_PRODUTOS (wide produto x anos)
+# =============================================================================
+
+def montar_evolucao_produtos(df_com_produtos: pd.DataFrame) -> pd.DataFrame:
+    """1 linha por produto; colunas = anos + TOTAL_PERIODO (volume PF)."""
+    if (
+        df_com_produtos.empty
+        or "ANO" not in df_com_produtos.columns
+        or "VENDAS_TOTAIS" not in df_com_produtos.columns
+    ):
+        return pd.DataFrame()
+
+    df = df_com_produtos.copy()
+    df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce").astype("Int64")
+    df["VENDAS_TOTAIS"] = pd.to_numeric(df["VENDAS_TOTAIS"], errors="coerce")
+    df = df[df["ANO"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+
+    campos_id = [c for c in ["NR_REGISTRO", "MARCA_COMERCIAL"] if c in df.columns]
+    if not campos_id:
+        return pd.DataFrame()
+
+    agg = df.groupby(campos_id + ["ANO"], as_index=False)["VENDAS_TOTAIS"].sum()
+    pivot = agg.pivot_table(
+        index=campos_id, columns="ANO", values="VENDAS_TOTAIS", aggfunc="sum", fill_value=0
+    )
+    anos_ordenados = sorted(pivot.columns.tolist())
+    pivot = pivot[anos_ordenados]
+    colunas_ano = [str(int(a)) for a in anos_ordenados]
+    pivot.columns = colunas_ano
+    pivot["TOTAL_PERIODO"] = pivot[colunas_ano].sum(axis=1)
+    pivot = pivot.reset_index()
+    return pivot.sort_values("TOTAL_PERIODO", ascending=False).reset_index(drop=True)
 
 
-# ---------- Tabela 4: Comercializacao_IA (1 linha = Registro x Ano x IA) ----------
-# Perspectiva IA: NAO consolida. Cada ingrediente ativo permanece em linha propria
-# com sua PONDERACAO_IA e volumes ponderados individuais.
+# =============================================================================
+# 04 - COMERCIALIZACAO_IA (Registro x Ano x IA)
+# =============================================================================
+
 def montar_comercializacao_ia(
-    df_vendas: pd.DataFrame, df_produtos: pd.DataFrame
+    df_vendas: pd.DataFrame, df_resumo_agrofit: pd.DataFrame
 ) -> pd.DataFrame:
+    """1 linha = Registro x Ano x IA. Originais PF + ponderados desta IA."""
     if df_vendas.empty:
         return pd.DataFrame()
 
     df = calcular_venda_estimada_ia(df_vendas.copy())
     df = _enriquecer_com_agrofit(
-        df, df_produtos, campos=["MARCA_COMERCIAL", "TITULAR_DE_REGISTRO", "FORMULACAO"]
+        df, df_resumo_agrofit, campos=["MARCA_COMERCIAL", "TITULAR_DE_REGISTRO", "FORMULACAO"]
     )
     if "DETENTOR" not in df.columns:
         df["DETENTOR"] = np.nan
-
     if "VENDA_PONDERADA_IA" in df.columns:
         df["VENDA_ESTIMADA_IA"] = df["VENDA_PONDERADA_IA"]
     elif "VENDA_ESTIMADA_IA" in df.columns:
@@ -1217,11 +1101,10 @@ def montar_comercializacao_ia(
         "NR_REGISTRO", "ANO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
         "DETENTOR", "PRODUTO_TECNICO", "CONCENTRACAO", "UNIDADE", "CLASSES_USO",
         "PONDERACAO_IA",
-        # Volumes PF da linha (iguais entre IAs do mesmo produto — nao somar entre IAs
-        # se o objetivo for volume do produto; use 03_Comerc_Produto para isso)
+        # Originais PF da linha (iguais entre IAs do mesmo produto — NAO somar entre IAs)
         "ESTOQUE_INICIAL", "PRODUCAO_NACIONAL", "IMPORTACAO", "EXPORTACAO",
         "VENDAS_INDUSTRIA", "VENDAS_CLIENTE", "VENDAS_TOTAIS", "ESTOQUE_FINAL",
-        # Volumes ponderados DESTA IA
+        # Ponderados DESTA IA
         "ESTOQUE_INICIAL_PONDERADO_IA", "PRODUCAO_NACIONAL_PONDERADA_IA",
         "IMPORTACAO_PONDERADA_IA", "EXPORTACAO_PONDERADA_IA",
         "VENDAS_INDUSTRIA_PONDERADA_IA", "VENDAS_CLIENTE_PONDERADA_IA",
@@ -1236,153 +1119,79 @@ def montar_comercializacao_ia(
     )
 
 
-# ---------- Tabela 5: Comercializacao_UF (produto; 1 linha = Registro x Ano x UF) ----------
-# Volumes de UF sao de produto formulado. Multi-IA: deduplica com max para nao
-# multiplicar o volume do produto pelo numero de ingredientes ativos.
-def montar_comercializacao_uf(
-    df_vendas: pd.DataFrame, df_produtos: Optional[pd.DataFrame] = None
-) -> pd.DataFrame:
-    if df_vendas.empty:
-        return pd.DataFrame(columns=[
-            "ANO", "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
-            "UF", "REGIAO", "VENDA",
-        ])
-    df_long = montar_venda_para_uf_longo(df_vendas, ["_CHAVE_REGISTRO", "NR_REGISTRO", "ANO"])
-    if df_long.empty:
-        return df_long
-    # max (nao sum): multi-IA repete o mesmo volume PF em cada linha de IA
-    df_long = df_long.groupby(
-        ["_CHAVE_REGISTRO", "NR_REGISTRO", "ANO", "UF", "REGIAO"], as_index=False
-    )["VENDA"].max()
+# =============================================================================
+# 05 - VENDAS_IA (IA x Ano, agregacao ponderada)
+# =============================================================================
 
-    if df_produtos is not None and not df_produtos.empty:
-        campos_id = [c for c in ["MARCA_COMERCIAL", "INGREDIENTE_ATIVO"] if c in df_produtos.columns]
-        if campos_id:
-            df_prod_aux = df_produtos[["_CHAVE_REGISTRO"] + campos_id].drop_duplicates("_CHAVE_REGISTRO")
-            df_long = df_long.merge(df_prod_aux, on="_CHAVE_REGISTRO", how="left")
-
-    ordem = [
-        "ANO", "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
-        "UF", "REGIAO", "VENDA", "_CHAVE_REGISTRO",
-    ]
-    ordem = [c for c in ordem if c in df_long.columns]
-    return df_long[ordem].sort_values(["ANO", "NR_REGISTRO", "UF"]).reset_index(drop=True)
-
-
-# ---------- Tabela 6: IA_Anual (agrega a partir da perspectiva IA) ----------
-def montar_ia_anual(df_com_ia: pd.DataFrame) -> pd.DataFrame:
+def montar_vendas_ia(df_com_ia: pd.DataFrame) -> pd.DataFrame:
+    """1 linha = IA x Ano. Soma dos volumes PONDERADOS. Contagens de produtos/registros."""
     if df_com_ia.empty or "INGREDIENTE_ATIVO" not in df_com_ia.columns:
         return pd.DataFrame()
+
     df = df_com_ia.copy()
     df = df[df["INGREDIENTE_ATIVO"].notna() & (df["INGREDIENTE_ATIVO"].astype(str).str.strip() != "")]
-    # Normaliza IA para reduzir fragmentacao (acentos/caixa); mantem nome canonico
     df["_IA_NORM"] = df["INGREDIENTE_ATIVO"].apply(normalizar_ia)
     canon = df.groupby("_IA_NORM")["INGREDIENTE_ATIVO"].agg(lambda s: s.value_counts().index[0])
     df["INGREDIENTE_ATIVO"] = df["_IA_NORM"].map(canon)
     df = df.drop(columns=["_IA_NORM"])
-    # Evita contar o mesmo produto N vezes no volume PF ao agregar por IA:
-    # para VENDA_TOTAL (PF) usamos o volume da linha (cada linha = um produto-IA);
-    # a metrica correta de "quanto de IA foi comercializado" e VENDA_PONDERADA_IA.
-    agg_kwargs = dict(
-        NUM_REGISTROS=("NR_REGISTRO", "nunique"),
-        VENDA_TOTAL_PF=("VENDAS_TOTAIS", "sum"),
-        VENDA_PONDERADA_IA=("VENDA_PONDERADA_IA", "sum"),
-        VENDA_ESTIMADA_IA=("VENDA_ESTIMADA_IA", "sum"),
-        PRODUCAO_NACIONAL_PONDERADA_IA=("PRODUCAO_NACIONAL_PONDERADA_IA", "sum"),
-        IMPORTACAO_PONDERADA_IA=("IMPORTACAO_PONDERADA_IA", "sum"),
-        EXPORTACAO_PONDERADA_IA=("EXPORTACAO_PONDERADA_IA", "sum"),
-        VENDAS_INDUSTRIA_PONDERADA_IA=("VENDAS_INDUSTRIA_PONDERADA_IA", "sum"),
-        VENDAS_CLIENTE_PONDERADA_IA=("VENDAS_CLIENTE_PONDERADA_IA", "sum"),
-        ESTOQUE_INICIAL_PONDERADO_IA=("ESTOQUE_INICIAL_PONDERADO_IA", "sum"),
-        ESTOQUE_FINAL_PONDERADO_IA=("ESTOQUE_FINAL_PONDERADO_IA", "sum"),
-    )
+
+    agg_kwargs: Dict[str, Any] = {
+        "NUM_REGISTROS": ("NR_REGISTRO", "nunique"),
+        "VENDA_TOTAL_PF_ASSOCIADA": ("VENDAS_TOTAIS", "sum"),
+        "VENDA_PONDERADA_IA": ("VENDA_PONDERADA_IA", "sum"),
+        "VENDA_ESTIMADA_IA": ("VENDA_ESTIMADA_IA", "sum"),
+        "PRODUCAO_NACIONAL_PONDERADA_IA": ("PRODUCAO_NACIONAL_PONDERADA_IA", "sum"),
+        "IMPORTACAO_PONDERADA_IA": ("IMPORTACAO_PONDERADA_IA", "sum"),
+        "EXPORTACAO_PONDERADA_IA": ("EXPORTACAO_PONDERADA_IA", "sum"),
+        "VENDAS_INDUSTRIA_PONDERADA_IA": ("VENDAS_INDUSTRIA_PONDERADA_IA", "sum"),
+        "VENDAS_CLIENTE_PONDERADA_IA": ("VENDAS_CLIENTE_PONDERADA_IA", "sum"),
+        "ESTOQUE_INICIAL_PONDERADO_IA": ("ESTOQUE_INICIAL_PONDERADO_IA", "sum"),
+        "ESTOQUE_FINAL_PONDERADO_IA": ("ESTOQUE_FINAL_PONDERADO_IA", "sum"),
+    }
     if "MARCA_COMERCIAL" in df.columns:
         agg_kwargs["NUM_PRODUTOS"] = ("MARCA_COMERCIAL", "nunique")
     else:
         agg_kwargs["NUM_PRODUTOS"] = ("NR_REGISTRO", "nunique")
+
     agg_kwargs = {
         k: v for k, v in agg_kwargs.items()
         if v[0] in df.columns or k in ("NUM_REGISTROS", "NUM_PRODUTOS")
     }
     grp = df.groupby(["ANO", "INGREDIENTE_ATIVO"], as_index=False).agg(**agg_kwargs)
-    # Alias principal de ordenacao = quantidade efetiva de IA
+
     if "VENDA_PONDERADA_IA" in grp.columns:
         grp["VENDA_TOTAL"] = grp["VENDA_PONDERADA_IA"]
-    elif "VENDA_TOTAL_PF" in grp.columns:
-        grp["VENDA_TOTAL"] = grp["VENDA_TOTAL_PF"]
+    elif "VENDA_TOTAL_PF_ASSOCIADA" in grp.columns:
+        grp["VENDA_TOTAL"] = grp["VENDA_TOTAL_PF_ASSOCIADA"]
+
     return grp.sort_values(["ANO", "VENDA_TOTAL"], ascending=[True, False]).reset_index(drop=True)
 
 
-# ---------- Tabela 10: Evolucao_Produtos_Anual (WIDE: produto x ano) ----------
-# 1 linha por produto (Registro), 1 coluna por ANO com o volume total
-# comercializado (VENDAS_TOTAIS, perspectiva PRODUTO/PF) + coluna TOTAL_PERIODO
-# com a soma de todos os anos. Formato ideal para levantar graficos de
-# evolucao anual de uso por produto (linhas = produtos, colunas = anos) —
-# basta selecionar as colunas de ano e montar um grafico de linhas/tabela
-# dinamica diretamente no Excel.
-def montar_evolucao_produtos_anual(df_com_produto: pd.DataFrame) -> pd.DataFrame:
+# =============================================================================
+# 06 - EVOLUCAO_IA (wide IA x anos)
+# =============================================================================
+
+def montar_evolucao_ia(df_vendas_ia: pd.DataFrame) -> pd.DataFrame:
+    """1 linha por IA; colunas = anos + TOTAL_PERIODO (volume ponderado)."""
     if (
-        df_com_produto.empty
-        or "ANO" not in df_com_produto.columns
-        or "VENDAS_TOTAIS" not in df_com_produto.columns
-    ):
-        return pd.DataFrame()
-
-    df = df_com_produto.copy()
-    if not pd.api.types.is_numeric_dtype(df["ANO"]):
-        df["ANO"] = converter_numero_br(df["ANO"])
-    df["ANO"] = df["ANO"].astype("Int64")
-    df["VENDAS_TOTAIS"] = pd.to_numeric(df["VENDAS_TOTAIS"], errors="coerce")
-    df = df[df["ANO"].notna()]
-    if df.empty:
-        return pd.DataFrame()
-
-    campos_id = [c for c in ["NR_REGISTRO", "MARCA_COMERCIAL"] if c in df.columns]
-    if not campos_id:
-        return pd.DataFrame()
-
-    # 1 linha por produto x ano (soma caso ainda exista alguma granularidade extra)
-    agg = df.groupby(campos_id + ["ANO"], as_index=False)["VENDAS_TOTAIS"].sum()
-
-    pivot = agg.pivot_table(
-        index=campos_id, columns="ANO", values="VENDAS_TOTAIS", aggfunc="sum", fill_value=0
-    )
-    anos_ordenados = sorted(pivot.columns.tolist())
-    pivot = pivot[anos_ordenados]
-    colunas_ano = [str(int(a)) for a in anos_ordenados]
-    pivot.columns = colunas_ano
-    pivot["TOTAL_PERIODO"] = pivot[colunas_ano].sum(axis=1)
-    pivot = pivot.reset_index()
-    return pivot.sort_values("TOTAL_PERIODO", ascending=False).reset_index(drop=True)
-
-
-# ---------- Tabela 11: Evolucao_IA_Anual (WIDE: ingrediente ativo x ano) ----------
-# 1 linha por ingrediente ativo, 1 coluna por ANO com a venda ponderada/
-# estimada de IA (perspectiva IA) + coluna TOTAL_PERIODO com a soma de todos
-# os anos. Construida a partir de 06_IA_Anual (ja agregada por ANO x
-# INGREDIENTE_ATIVO), evitando somar novamente o volume de produto (PF).
-def montar_evolucao_ia_anual(df_ia_anual: pd.DataFrame) -> pd.DataFrame:
-    if (
-        df_ia_anual.empty
-        or "ANO" not in df_ia_anual.columns
-        or "INGREDIENTE_ATIVO" not in df_ia_anual.columns
+        df_vendas_ia.empty
+        or "ANO" not in df_vendas_ia.columns
+        or "INGREDIENTE_ATIVO" not in df_vendas_ia.columns
     ):
         return pd.DataFrame()
 
     valor_col = next(
         (
-            c for c in ["VENDA_PONDERADA_IA", "VENDA_ESTIMADA_IA", "VENDA_TOTAL", "VENDA_TOTAL_PF"]
-            if c in df_ia_anual.columns
+            c for c in ["VENDA_PONDERADA_IA", "VENDA_ESTIMADA_IA", "VENDA_TOTAL", "VENDA_TOTAL_PF_ASSOCIADA"]
+            if c in df_vendas_ia.columns
         ),
         None,
     )
     if valor_col is None:
         return pd.DataFrame()
 
-    df = df_ia_anual.copy()
-    if not pd.api.types.is_numeric_dtype(df["ANO"]):
-        df["ANO"] = converter_numero_br(df["ANO"])
-    df["ANO"] = df["ANO"].astype("Int64")
+    df = df_vendas_ia.copy()
+    df["ANO"] = pd.to_numeric(df["ANO"], errors="coerce").astype("Int64")
     df[valor_col] = pd.to_numeric(df[valor_col], errors="coerce")
     df = df[df["ANO"].notna() & df["INGREDIENTE_ATIVO"].notna()]
     df = df[df["INGREDIENTE_ATIVO"].astype(str).str.strip() != ""]
@@ -1401,316 +1210,134 @@ def montar_evolucao_ia_anual(df_ia_anual: pd.DataFrame) -> pd.DataFrame:
     return pivot.sort_values("TOTAL_PERIODO", ascending=False).reset_index(drop=True)
 
 
-# ---------- Tabela 7: IA_UF ----------
-# Venda estimada de cada IA por UF = volume PF da UF do produto x ponderacao da IA.
-def montar_ia_uf(df_com_uf: pd.DataFrame, df_com_ia: pd.DataFrame) -> pd.DataFrame:
+# =============================================================================
+# 07 - COMERCIALIZACAO_REGIONAL_PRODUTOS (Registro x Ano x UF)
+# =============================================================================
+
+def montar_comercializacao_regional_produtos(
+    df_vendas: pd.DataFrame, df_resumo_agrofit: Optional[pd.DataFrame] = None
+) -> pd.DataFrame:
+    """1 linha = Registro x Ano x UF. Volume PF. Multi-IA: max (nao soma)."""
+    if df_vendas.empty:
+        return pd.DataFrame(columns=[
+            "ANO", "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
+            "UF", "REGIAO", "VENDA",
+        ])
+
+    df_long = montar_venda_para_uf_longo(df_vendas, ["_CHAVE_REGISTRO", "NR_REGISTRO", "ANO"])
+    if df_long.empty:
+        return df_long
+
+    # max: multi-IA repete o mesmo volume PF
+    df_long = df_long.groupby(
+        ["_CHAVE_REGISTRO", "NR_REGISTRO", "ANO", "UF", "REGIAO"], as_index=False
+    )["VENDA"].max()
+
+    if df_resumo_agrofit is not None and not df_resumo_agrofit.empty:
+        campos_id = [c for c in ["MARCA_COMERCIAL", "INGREDIENTE_ATIVO"] if c in df_resumo_agrofit.columns]
+        if campos_id:
+            df_prod_aux = df_resumo_agrofit[["_CHAVE_REGISTRO"] + campos_id].drop_duplicates("_CHAVE_REGISTRO")
+            df_long = df_long.merge(df_prod_aux, on="_CHAVE_REGISTRO", how="left")
+
+    ordem = [
+        "ANO", "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
+        "UF", "REGIAO", "VENDA", "_CHAVE_REGISTRO",
+    ]
+    ordem = [c for c in ordem if c in df_long.columns]
+    return df_long[ordem].sort_values(["ANO", "NR_REGISTRO", "UF"]).reset_index(drop=True)
+
+
+# =============================================================================
+# 08 - COMERCIALIZACAO_REGIONAL_IA (IA x Ano x UF)
+# =============================================================================
+
+def montar_comercializacao_regional_ia(
+    df_com_uf: pd.DataFrame, df_com_ia: pd.DataFrame
+) -> pd.DataFrame:
+    """VENDA_IA_UF = VENDA_PF_UF x PONDERACAO_IA. Agregado por IA x Ano x UF."""
     if df_com_uf.empty or df_com_ia.empty or "INGREDIENTE_ATIVO" not in df_com_ia.columns:
         return pd.DataFrame()
+
     cols_ia = ["_CHAVE_REGISTRO", "ANO", "INGREDIENTE_ATIVO"]
     if "PONDERACAO_IA" in df_com_ia.columns:
         cols_ia.append("PONDERACAO_IA")
     df_ia = df_com_ia[cols_ia].drop_duplicates()
     df_ia = df_ia[df_ia["INGREDIENTE_ATIVO"].notna()]
 
-    # Remove colunas que tambem existem em df_ia para evitar sufixos _x/_y no merge
-    cols_uf = [
-        c for c in df_com_uf.columns
-        if c not in {"INGREDIENTE_ATIVO", "PONDERACAO_IA", "MARCA_COMERCIAL"}
-    ]
-    # Mantem identificadores e volume de UF (produto formulado)
     essenciais = ["_CHAVE_REGISTRO", "ANO", "UF", "REGIAO", "VENDA"]
-    for c in essenciais:
-        if c in df_com_uf.columns and c not in cols_uf:
-            cols_uf.append(c)
+    cols_uf = [c for c in essenciais if c in df_com_uf.columns]
     df_uf = df_com_uf[cols_uf].copy()
 
     df = df_uf.merge(df_ia, on=["_CHAVE_REGISTRO", "ANO"], how="inner")
     if "PONDERACAO_IA" in df.columns:
         df["VENDA"] = df["VENDA"] * df["PONDERACAO_IA"]
+
     if "INGREDIENTE_ATIVO" not in df.columns or "VENDA" not in df.columns:
         return pd.DataFrame()
+
+    # Normaliza IA
+    df["_IA_NORM"] = df["INGREDIENTE_ATIVO"].apply(normalizar_ia)
+    canon = df.groupby("_IA_NORM")["INGREDIENTE_ATIVO"].agg(lambda s: s.value_counts().index[0])
+    df["INGREDIENTE_ATIVO"] = df["_IA_NORM"].map(canon)
+
     grp = df.groupby(["ANO", "INGREDIENTE_ATIVO", "UF", "REGIAO"], as_index=False)["VENDA"].sum()
-    return grp.sort_values(["ANO", "INGREDIENTE_ATIVO", "VENDA"], ascending=[True, True, False]).reset_index(drop=True)
+    return grp.sort_values(
+        ["ANO", "INGREDIENTE_ATIVO", "VENDA"], ascending=[True, True, False]
+    ).reset_index(drop=True)
 
 
-# ---------- Tabela unificada: Produtos (cadastro + KPIs + evolucao anual) ----------
-# Substitui 01_Produtos + 08_Registro_Resumo + 10_Evol_Produtos_Anual.
-# 1 linha por registro: atributos Agrofit, contagens de uso, flags de match,
-# metricas de venda no periodo e colunas wide por ano (volume PF).
-def montar_produtos_completo(
-    df_agrofit: pd.DataFrame,
-    df_produtos: pd.DataFrame,
-    df_com_produto: pd.DataFrame,
+# =============================================================================
+# COBERTURA / NAO-MATCH
+# =============================================================================
+
+def montar_agrofit_sem_vendas(
+    df_resumo_agrofit: pd.DataFrame, df_com_produtos: pd.DataFrame
 ) -> pd.DataFrame:
-    base_cols = [
+    chaves_com = set(df_com_produtos["_CHAVE_REGISTRO"].unique()) if not df_com_produtos.empty else set()
+    colunas = [
         c for c in [
-            "_CHAVE_REGISTRO", "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
-            "TITULAR_DE_REGISTRO", "FORMULACAO", "CLASSE", "MODO_DE_ACAO",
-            "EMPRESA_PAIS_TIPO", "CLASSE_TOXICOLOGICA", "CLASSE_AMBIENTAL",
-            "ORGANICOS", "SITUACAO",
-        ] if c in df_produtos.columns
+            "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
+            "TITULAR_DE_REGISTRO", "FORMULACAO", "SITUACAO", "_CHAVE_REGISTRO",
+        ] if c in df_resumo_agrofit.columns
     ]
-    df = df_produtos[base_cols].copy()
-
-    # Contagens de uso direto da base Agrofit (sem aba 02)
-    if not df_agrofit.empty and "_CHAVE_REGISTRO" in df_agrofit.columns:
-        agg_uso = {}
-        if "CULTURA" in df_agrofit.columns:
-            agg_uso["NUM_CULTURAS"] = ("CULTURA", "nunique")
-        if "PRAGA_NOME_CIENTIFICO" in df_agrofit.columns:
-            agg_uso["NUM_PRAGAS"] = ("PRAGA_NOME_CIENTIFICO", "nunique")
-        if agg_uso:
-            uso = df_agrofit.groupby("_CHAVE_REGISTRO").agg(**agg_uso).reset_index()
-            df = df.merge(uso, on="_CHAVE_REGISTRO", how="left")
-    if "NUM_CULTURAS" not in df.columns:
-        df["NUM_CULTURAS"] = 0
-    if "NUM_PRAGAS" not in df.columns:
-        df["NUM_PRAGAS"] = 0
-    df["NUM_CULTURAS"] = df["NUM_CULTURAS"].fillna(0).astype(int)
-    df["NUM_PRAGAS"] = df["NUM_PRAGAS"].fillna(0).astype(int)
-
-    # Metricas de comercializacao (periodo) + wide anual
-    anos_cols: List[str] = []
-    if not df_com_produto.empty and "VENDAS_TOTAIS" in df_com_produto.columns:
-        com = df_com_produto.copy()
-        com["VENDAS_TOTAIS"] = pd.to_numeric(com["VENDAS_TOTAIS"], errors="coerce")
-        if "ANO" in com.columns:
-            com["ANO"] = pd.to_numeric(com["ANO"], errors="coerce").astype("Int64")
-
-        com_agg = com.groupby("_CHAVE_REGISTRO").agg(
-            PRIMEIRO_ANO_COMERCIALIZACAO=("ANO", "min"),
-            ULTIMO_ANO_COMERCIALIZACAO=("ANO", "max"),
-            VENDA_TOTAL_PERIODO=("VENDAS_TOTAIS", "sum"),
-        ).reset_index()
-        df = df.merge(com_agg, on="_CHAVE_REGISTRO", how="left")
-
-        # Wide: anos como colunas
-        com_ano = com.dropna(subset=["ANO"]).groupby(
-            ["_CHAVE_REGISTRO", "ANO"], as_index=False
-        )["VENDAS_TOTAIS"].sum()
-        if not com_ano.empty:
-            pivot = com_ano.pivot_table(
-                index="_CHAVE_REGISTRO", columns="ANO",
-                values="VENDAS_TOTAIS", aggfunc="sum", fill_value=0,
-            )
-            anos_ordenados = sorted(pivot.columns.tolist())
-            pivot = pivot[anos_ordenados]
-            anos_cols = [str(int(a)) for a in anos_ordenados]
-            pivot.columns = anos_cols
-            df = df.merge(pivot.reset_index(), on="_CHAVE_REGISTRO", how="left")
-            for c in anos_cols:
-                df[c] = df[c].fillna(0)
-    else:
-        for c in ["PRIMEIRO_ANO_COMERCIALIZACAO", "ULTIMO_ANO_COMERCIALIZACAO", "VENDA_TOTAL_PERIODO"]:
-            df[c] = np.nan
-
-    # Flags de cobertura
-    chaves_com = set(df_com_produto["_CHAVE_REGISTRO"].unique()) if not df_com_produto.empty else set()
-    df["TEM_COMERCIALIZACAO"] = df["_CHAVE_REGISTRO"].apply(
-        lambda k: "SIM" if k in chaves_com else "NAO"
-    )
-    df["TEM_AGROFIT"] = "SIM"
-
-    # Outer: incluir registros so de comercializacao (sem Agrofit)
-    if not df_com_produto.empty:
-        so_com = df_com_produto[~df_com_produto["_CHAVE_REGISTRO"].isin(set(df["_CHAVE_REGISTRO"]))].copy()
-        if not so_com.empty:
-            extra_keys = so_com.groupby("_CHAVE_REGISTRO", as_index=False).agg(
-                NR_REGISTRO=("NR_REGISTRO", "first"),
-                MARCA_COMERCIAL=("MARCA_COMERCIAL", "first") if "MARCA_COMERCIAL" in so_com.columns else ("NR_REGISTRO", "first"),
-                INGREDIENTE_ATIVO=("INGREDIENTE_ATIVO", "first") if "INGREDIENTE_ATIVO" in so_com.columns else ("NR_REGISTRO", "first"),
-                PRIMEIRO_ANO_COMERCIALIZACAO=("ANO", "min"),
-                ULTIMO_ANO_COMERCIALIZACAO=("ANO", "max"),
-                VENDA_TOTAL_PERIODO=("VENDAS_TOTAIS", "sum"),
-            )
-            # wide para extras
-            if anos_cols:
-                com_ano2 = so_com.dropna(subset=["ANO"]).copy()
-                com_ano2["ANO"] = pd.to_numeric(com_ano2["ANO"], errors="coerce")
-                com_ano2 = com_ano2.groupby(["_CHAVE_REGISTRO", "ANO"], as_index=False)["VENDAS_TOTAIS"].sum()
-                piv2 = com_ano2.pivot_table(
-                    index="_CHAVE_REGISTRO", columns="ANO",
-                    values="VENDAS_TOTAIS", aggfunc="sum", fill_value=0,
-                )
-                for a in anos_cols:
-                    ai = int(a)
-                    if ai in piv2.columns:
-                        extra_keys[a] = extra_keys["_CHAVE_REGISTRO"].map(piv2[ai]).fillna(0)
-                    else:
-                        extra_keys[a] = 0
-            extra_keys["TEM_COMERCIALIZACAO"] = "SIM"
-            extra_keys["TEM_AGROFIT"] = "NAO"
-            extra_keys["NUM_CULTURAS"] = 0
-            extra_keys["NUM_PRAGAS"] = 0
-            df = pd.concat([df, extra_keys], ignore_index=True, sort=False)
-
-    if "VENDA_TOTAL_PERIODO" not in df.columns:
-        df["VENDA_TOTAL_PERIODO"] = np.nan
-    # TOTAL_PERIODO alias para compatibilidade com evolucao
-    df["TOTAL_PERIODO"] = df["VENDA_TOTAL_PERIODO"]
-
-    # Ordenacao de colunas
-    id_cols = [c for c in [
-        "NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO", "TITULAR_DE_REGISTRO",
-        "FORMULACAO", "CLASSE", "MODO_DE_ACAO", "CLASSE_TOXICOLOGICA", "CLASSE_AMBIENTAL",
-        "ORGANICOS", "SITUACAO", "EMPRESA_PAIS_TIPO",
-        "NUM_CULTURAS", "NUM_PRAGAS",
-        "TEM_AGROFIT", "TEM_COMERCIALIZACAO",
-        "PRIMEIRO_ANO_COMERCIALIZACAO", "ULTIMO_ANO_COMERCIALIZACAO",
-    ] if c in df.columns]
-    mid = anos_cols
-    tail = [c for c in ["VENDA_TOTAL_PERIODO", "TOTAL_PERIODO", "_CHAVE_REGISTRO"] if c in df.columns]
-    ordem = id_cols + mid + tail
-    extras = [c for c in df.columns if c not in ordem]
-    df = df[ordem + extras]
-
-    return df.sort_values("VENDA_TOTAL_PERIODO", ascending=False, na_position="last").reset_index(drop=True)
-
-
-# ---------- Tabela unificada: IA_Resumo + Evolucao anual ----------
-# Substitui 09_IA_Resumo + 11_Evol_IA_Anual.
-def montar_ia_resumo_evol(
-    df_agrofit: pd.DataFrame, df_com_ia: pd.DataFrame, df_ia_anual: pd.DataFrame
-) -> pd.DataFrame:
-    if df_com_ia.empty or "INGREDIENTE_ATIVO" not in df_com_ia.columns:
-        return pd.DataFrame()
-
-    df_ia = df_com_ia[
-        df_com_ia["INGREDIENTE_ATIVO"].notna()
-        & (df_com_ia["INGREDIENTE_ATIVO"].astype(str).str.strip() != "")
-    ].copy()
-    if df_ia.empty:
-        return pd.DataFrame()
-
-    # Chave normalizada de IA para agregacao estavel
-    df_ia["_IA_NORM"] = df_ia["INGREDIENTE_ATIVO"].apply(normalizar_ia)
-    # Nome de exibicao = mais frequente por chave normalizada
-    nome_canonic = (
-        df_ia.groupby("_IA_NORM")["INGREDIENTE_ATIVO"]
-        .agg(lambda s: s.value_counts().index[0])
-        .to_dict()
-    )
-    df_ia["INGREDIENTE_ATIVO"] = df_ia["_IA_NORM"].map(nome_canonic)
-
-    agg_map: Dict[str, Any] = {
-        "PRIMEIRO_ANO": ("ANO", "min"),
-        "ULTIMO_ANO": ("ANO", "max"),
-        "NUM_REGISTROS_COM_VENDAS": ("NR_REGISTRO", "nunique"),
-    }
-    if "MARCA_COMERCIAL" in df_ia.columns:
-        agg_map["NUM_PRODUTOS_COM_VENDAS"] = ("MARCA_COMERCIAL", "nunique")
-    if "VENDA_ESTIMADA_IA" in df_ia.columns:
-        agg_map["VENDA_ESTIMADA_IA_PERIODO"] = ("VENDA_ESTIMADA_IA", "sum")
-    elif "VENDA_PONDERADA_IA" in df_ia.columns:
-        agg_map["VENDA_ESTIMADA_IA_PERIODO"] = ("VENDA_PONDERADA_IA", "sum")
-    for src, dst in [
-        ("PRODUCAO_NACIONAL_PONDERADA_IA", "PRODUCAO_NACIONAL_PONDERADA_IA_PERIODO"),
-        ("IMPORTACAO_PONDERADA_IA", "IMPORTACAO_PONDERADA_IA_PERIODO"),
-        ("EXPORTACAO_PONDERADA_IA", "EXPORTACAO_PONDERADA_IA_PERIODO"),
-    ]:
-        if src in df_ia.columns:
-            agg_map[dst] = (src, "sum")
-
-    base = df_ia.groupby("INGREDIENTE_ATIVO", as_index=False).agg(**agg_map)
-
-    # Enriquecimento Agrofit com IA normalizada
-    if not df_agrofit.empty and "INGREDIENTE_ATIVO" in df_agrofit.columns:
-        agro = df_agrofit.copy()
-        agro["_IA_NORM"] = agro["INGREDIENTE_ATIVO"].apply(normalizar_ia)
-        agro["INGREDIENTE_ATIVO"] = agro["_IA_NORM"].map(
-            lambda k: nome_canonic.get(k, k) if pd.notna(k) else k
-        )
-        agro_agg = agro.groupby("INGREDIENTE_ATIVO").agg(
-            NUM_PRODUTOS_AGROFIT=("MARCA_COMERCIAL", "nunique") if "MARCA_COMERCIAL" in agro.columns else ("_CHAVE_REGISTRO", "nunique"),
-            NUM_REGISTROS_AGROFIT=("_CHAVE_REGISTRO", "nunique"),
-            NUM_CULTURAS_AGROFIT=("CULTURA", "nunique") if "CULTURA" in agro.columns else ("_CHAVE_REGISTRO", "nunique"),
-            NUM_PRAGAS_AGROFIT=("PRAGA_NOME_CIENTIFICO", "nunique") if "PRAGA_NOME_CIENTIFICO" in agro.columns else ("_CHAVE_REGISTRO", "nunique"),
-        ).reset_index()
-        base = base.merge(agro_agg, on="INGREDIENTE_ATIVO", how="left")
-
-    # Wide anual a partir de IA_Anual (ja agregado)
-    if df_ia_anual is not None and not df_ia_anual.empty:
-        valor_col = next(
-            (c for c in ["VENDA_PONDERADA_IA", "VENDA_ESTIMADA_IA", "VENDA_TOTAL", "VENDA_TOTAL_PF"]
-             if c in df_ia_anual.columns),
-            None,
-        )
-        if valor_col:
-            ev = df_ia_anual.copy()
-            ev["_IA_NORM"] = ev["INGREDIENTE_ATIVO"].apply(normalizar_ia)
-            ev["INGREDIENTE_ATIVO"] = ev["_IA_NORM"].map(
-                lambda k: nome_canonic.get(k, k) if pd.notna(k) else k
-            )
-            ev["ANO"] = pd.to_numeric(ev["ANO"], errors="coerce").astype("Int64")
-            ev[valor_col] = pd.to_numeric(ev[valor_col], errors="coerce")
-            ev = ev[ev["ANO"].notna() & ev["INGREDIENTE_ATIVO"].notna()]
-            if not ev.empty:
-                pivot = ev.pivot_table(
-                    index="INGREDIENTE_ATIVO", columns="ANO",
-                    values=valor_col, aggfunc="sum", fill_value=0,
-                )
-                anos_ordenados = sorted(pivot.columns.tolist())
-                pivot = pivot[anos_ordenados]
-                colunas_ano = [str(int(a)) for a in anos_ordenados]
-                pivot.columns = colunas_ano
-                pivot["TOTAL_PERIODO"] = pivot[colunas_ano].sum(axis=1)
-                base = base.merge(pivot.reset_index(), on="INGREDIENTE_ATIVO", how="left")
-                for c in colunas_ano + ["TOTAL_PERIODO"]:
-                    if c in base.columns:
-                        base[c] = base[c].fillna(0)
-
-    sort_col = "VENDA_ESTIMADA_IA_PERIODO"
-    if sort_col in base.columns:
-        return base.sort_values(sort_col, ascending=False, na_position="last").reset_index(drop=True)
-    return base.reset_index(drop=True)
-
-
-# ---------- Agrofit_Sem_Comercializacao ----------
-def montar_agrofit_sem_comercializacao(
-    df_produtos: pd.DataFrame, df_com_anual: pd.DataFrame
-) -> pd.DataFrame:
-    chaves_com = set(df_com_anual["_CHAVE_REGISTRO"].unique()) if not df_com_anual.empty else set()
-    colunas = [c for c in ["NR_REGISTRO", "MARCA_COMERCIAL", "INGREDIENTE_ATIVO",
-                            "TITULAR_DE_REGISTRO", "FORMULACAO", "SITUACAO",
-                            "_CHAVE_REGISTRO"] if c in df_produtos.columns]
-    df = df_produtos[colunas].copy()
+    df = df_resumo_agrofit[colunas].copy()
     df = df[~df["_CHAVE_REGISTRO"].isin(chaves_com)]
     df["TEM_COMERCIALIZACAO"] = "NAO"
-    return df.drop(columns=["_CHAVE_REGISTRO"]).reset_index(drop=True)
+    return df.drop(columns=["_CHAVE_REGISTRO"], errors="ignore").reset_index(drop=True)
 
 
-# ---------- Comercializacao_Sem_Agrofit ----------
-def montar_comercializacao_sem_agrofit(
-    df_com_anual: pd.DataFrame, df_produtos: pd.DataFrame
+def montar_vendas_sem_agrofit(
+    df_com_produtos: pd.DataFrame, df_resumo_agrofit: pd.DataFrame
 ) -> pd.DataFrame:
-    if df_com_anual.empty:
+    if df_com_produtos.empty:
         return pd.DataFrame()
-    chaves_agro = set(df_produtos["_CHAVE_REGISTRO"].unique())
-    df = df_com_anual[~df_com_anual["_CHAVE_REGISTRO"].isin(chaves_agro)].copy()
+    chaves_agro = set(df_resumo_agrofit["_CHAVE_REGISTRO"].unique())
+    df = df_com_produtos[~df_com_produtos["_CHAVE_REGISTRO"].isin(chaves_agro)].copy()
     df["ENCONTRADO_AGROFIT"] = "NAO"
-    return df.drop(columns=["_CHAVE_REGISTRO"]).reset_index(drop=True)
+    return df.drop(columns=["_CHAVE_REGISTRO"], errors="ignore").reset_index(drop=True)
 
 
-# ---------- Validacao (absorvida no 00_Resumo; mantida como helper) ----------
 def montar_validacao(
-    df_agrofit: pd.DataFrame, df_produtos: pd.DataFrame, df_com_anual: pd.DataFrame,
-    df_agrofit_sem_com: pd.DataFrame, df_com_sem_agro: pd.DataFrame,
+    df_resumo_agrofit: pd.DataFrame,
+    df_com_produtos: pd.DataFrame,
+    df_agrofit_sem: pd.DataFrame,
+    df_vendas_sem: pd.DataFrame,
 ) -> pd.DataFrame:
-    total_agrofit = df_produtos["_CHAVE_REGISTRO"].nunique() if "_CHAVE_REGISTRO" in df_produtos.columns else 0
-    total_com = df_com_anual["_CHAVE_REGISTRO"].nunique() if not df_com_anual.empty else 0
-    chaves_agro = set(df_produtos["_CHAVE_REGISTRO"].unique()) if "_CHAVE_REGISTRO" in df_produtos.columns else set()
-    chaves_com = set(df_com_anual["_CHAVE_REGISTRO"].unique()) if not df_com_anual.empty else set()
+    total_agrofit = df_resumo_agrofit["_CHAVE_REGISTRO"].nunique() if "_CHAVE_REGISTRO" in df_resumo_agrofit.columns else 0
+    total_com = df_com_produtos["_CHAVE_REGISTRO"].nunique() if not df_com_produtos.empty else 0
+    chaves_agro = set(df_resumo_agrofit["_CHAVE_REGISTRO"].unique()) if "_CHAVE_REGISTRO" in df_resumo_agrofit.columns else set()
+    chaves_com = set(df_com_produtos["_CHAVE_REGISTRO"].unique()) if not df_com_produtos.empty else set()
 
     encontrados = len(chaves_agro & chaves_com)
     apenas_agro = len(chaves_agro - chaves_com)
     apenas_com = len(chaves_com - chaves_agro)
     pct = round(100 * encontrados / total_agrofit, 2) if total_agrofit else 0.0
 
-    vol_total = float(df_com_anual["VENDAS_TOTAIS"].sum()) if not df_com_anual.empty and "VENDAS_TOTAIS" in df_com_anual.columns else 0.0
-    if not df_com_anual.empty and "VENDAS_TOTAIS" in df_com_anual.columns:
-        mask_match = df_com_anual["_CHAVE_REGISTRO"].isin(chaves_agro)
-        vol_match = float(df_com_anual.loc[mask_match, "VENDAS_TOTAIS"].sum())
-        vol_sem = float(df_com_anual.loc[~mask_match, "VENDAS_TOTAIS"].sum())
+    vol_total = float(df_com_produtos["VENDAS_TOTAIS"].sum()) if not df_com_produtos.empty and "VENDAS_TOTAIS" in df_com_produtos.columns else 0.0
+    if not df_com_produtos.empty and "VENDAS_TOTAIS" in df_com_produtos.columns:
+        mask_match = df_com_produtos["_CHAVE_REGISTRO"].isin(chaves_agro)
+        vol_match = float(df_com_produtos.loc[mask_match, "VENDAS_TOTAIS"].sum())
+        vol_sem = float(df_com_produtos.loc[~mask_match, "VENDAS_TOTAIS"].sum())
     else:
         vol_match = 0.0
         vol_sem = 0.0
@@ -1727,21 +1354,22 @@ def montar_validacao(
         ("VOLUME_PF_COM_MATCH_AGROFIT", round(vol_match, 2)),
         ("VOLUME_PF_SEM_AGROFIT", round(vol_sem, 2)),
         ("PERCENTUAL_VOLUME_COM_MATCH", pct_vol),
-        ("REGISTROS_COM_INFORMACOES_INCOMPLETAS_PRODUTOS",
-         int(df_produtos.isna().any(axis=1).sum()) if not df_produtos.empty else 0),
     ]
     return pd.DataFrame(linhas, columns=["INDICADOR", "VALOR"])
 
 
 # =============================================================================
-# RESUMO EXECUTIVO (aba 00_Resumo)
+# RESUMO EXECUTIVO E LEGENDA
 # =============================================================================
 
 def montar_resumo_executivo(
-    df_agrofit: pd.DataFrame, df_produtos: pd.DataFrame,
-    df_com_anual: pd.DataFrame, df_com_uf: pd.DataFrame, df_ia_anual: pd.DataFrame,
+    df_agrofit: pd.DataFrame,
+    df_resumo_agrofit: pd.DataFrame,
+    df_com_produtos: pd.DataFrame,
+    df_com_uf: pd.DataFrame,
+    df_vendas_ia: pd.DataFrame,
     df_validacao: Optional[pd.DataFrame] = None,
-    df_produtos_completo: Optional[pd.DataFrame] = None,
+    df_evol_produtos: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     indicadores = []
 
@@ -1750,48 +1378,57 @@ def montar_resumo_executivo(
 
     add("Numero de ingredientes ativos (Agrofit)", df_agrofit["INGREDIENTE_ATIVO"].nunique() if "INGREDIENTE_ATIVO" in df_agrofit.columns else 0)
     add("Numero de produtos / marcas (Agrofit)", df_agrofit["MARCA_COMERCIAL"].nunique() if "MARCA_COMERCIAL" in df_agrofit.columns else 0)
-    add("Numero de registros MAPA (Agrofit)", df_produtos["_CHAVE_REGISTRO"].nunique() if "_CHAVE_REGISTRO" in df_produtos.columns else 0)
+    add("Numero de registros MAPA (Agrofit)", df_resumo_agrofit["_CHAVE_REGISTRO"].nunique() if "_CHAVE_REGISTRO" in df_resumo_agrofit.columns else 0)
     add("Numero de culturas (Agrofit)", df_agrofit["CULTURA"].nunique() if "CULTURA" in df_agrofit.columns else 0)
     add("Numero de pragas (Agrofit)", df_agrofit["PRAGA_NOME_CIENTIFICO"].nunique() if "PRAGA_NOME_CIENTIFICO" in df_agrofit.columns else 0)
-    add("Numero de registros comercializados", df_com_anual["_CHAVE_REGISTRO"].nunique() if not df_com_anual.empty else 0)
-    add("Volume total comercializado PF (soma VENDAS_TOTAIS)", round(df_com_anual["VENDAS_TOTAIS"].sum(), 2) if not df_com_anual.empty and "VENDAS_TOTAIS" in df_com_anual.columns else 0)
+    add("Numero de registros comercializados", df_com_produtos["_CHAVE_REGISTRO"].nunique() if not df_com_produtos.empty else 0)
+    add(
+        "Volume total comercializado PF (soma VENDAS_TOTAIS)",
+        round(df_com_produtos["VENDAS_TOTAIS"].sum(), 2)
+        if not df_com_produtos.empty and "VENDAS_TOTAIS" in df_com_produtos.columns else 0,
+    )
+
     vol_ia = 0
-    if not df_ia_anual.empty:
-        col_ia = "VENDA_PONDERADA_IA" if "VENDA_PONDERADA_IA" in df_ia_anual.columns else (
-            "VENDA_ESTIMADA_IA" if "VENDA_ESTIMADA_IA" in df_ia_anual.columns else (
-                "VENDA_TOTAL" if "VENDA_TOTAL" in df_ia_anual.columns else None
-            )
+    if not df_vendas_ia.empty:
+        col_ia = next(
+            (c for c in ["VENDA_PONDERADA_IA", "VENDA_ESTIMADA_IA", "VENDA_TOTAL"] if c in df_vendas_ia.columns),
+            None,
         )
         if col_ia:
-            vol_ia = round(df_ia_anual[col_ia].sum(), 2)
+            vol_ia = round(df_vendas_ia[col_ia].sum(), 2)
     add("Volume estimado de IA comercializado (soma ponderada)", vol_ia)
     add("Numero de UFs com comercializacao", df_com_uf["UF"].nunique() if not df_com_uf.empty else 0)
-    add("Ano inicial", int(df_com_anual["ANO"].min()) if not df_com_anual.empty and df_com_anual["ANO"].notna().any() else None)
-    add("Ano final", int(df_com_anual["ANO"].max()) if not df_com_anual.empty and df_com_anual["ANO"].notna().any() else None)
+    add(
+        "Ano inicial",
+        int(df_com_produtos["ANO"].min())
+        if not df_com_produtos.empty and df_com_produtos["ANO"].notna().any() else None,
+    )
+    add(
+        "Ano final",
+        int(df_com_produtos["ANO"].max())
+        if not df_com_produtos.empty and df_com_produtos["ANO"].notna().any() else None,
+    )
 
-    # Qualidade do match (absorve 14_Validacao)
     if df_validacao is not None and not df_validacao.empty:
         add("--- QUALIDADE DO CRUZAMENTO ---", "")
         for _, row in df_validacao.iterrows():
             add(str(row["INDICADOR"]), row["VALOR"])
 
     df_resumo = pd.DataFrame(indicadores, columns=["INDICADOR", "VALOR"])
-
     rankings: Dict[str, pd.DataFrame] = {}
 
-    # Rankings enxutos: sem repetir todas as colunas de ano (detalhe nas abas 01/07)
-    if not df_ia_anual.empty and "VENDA_TOTAL" in df_ia_anual.columns:
+    if not df_vendas_ia.empty and "VENDA_TOTAL" in df_vendas_ia.columns:
         top_ia = (
-            df_ia_anual.groupby("INGREDIENTE_ATIVO", as_index=False)["VENDA_TOTAL"].sum()
+            df_vendas_ia.groupby("INGREDIENTE_ATIVO", as_index=False)["VENDA_TOTAL"].sum()
             .sort_values("VENDA_TOTAL", ascending=False).head(20).reset_index(drop=True)
         )
         rankings["Top20_Ingredientes_Ativos"] = top_ia
 
-        anos = sorted(df_ia_anual["ANO"].dropna().unique())
+        anos = sorted(df_vendas_ia["ANO"].dropna().unique())
         if len(anos) >= 2:
             ano_ini, ano_fim = anos[0], anos[-1]
-            base_ini = df_ia_anual[df_ia_anual["ANO"] == ano_ini].set_index("INGREDIENTE_ATIVO")["VENDA_TOTAL"]
-            base_fim = df_ia_anual[df_ia_anual["ANO"] == ano_fim].set_index("INGREDIENTE_ATIVO")["VENDA_TOTAL"]
+            base_ini = df_vendas_ia[df_vendas_ia["ANO"] == ano_ini].set_index("INGREDIENTE_ATIVO")["VENDA_TOTAL"]
+            base_fim = df_vendas_ia[df_vendas_ia["ANO"] == ano_fim].set_index("INGREDIENTE_ATIVO")["VENDA_TOTAL"]
             cresc = pd.DataFrame({"VENDA_INICIAL": base_ini, "VENDA_FINAL": base_fim}).fillna(0)
             cresc = cresc[cresc["VENDA_INICIAL"] > 0]
             cresc["CRESCIMENTO_PERCENTUAL"] = round(
@@ -1800,23 +1437,17 @@ def montar_resumo_executivo(
             cresc = cresc.reset_index().sort_values("CRESCIMENTO_PERCENTUAL", ascending=False).head(10)
             rankings["Top10_IA_Crescimento"] = cresc
 
-    # Top20 produtos enxuto a partir da tabela unificada
-    src_prod = df_produtos_completo if df_produtos_completo is not None else None
-    if src_prod is not None and not src_prod.empty and "VENDA_TOTAL_PERIODO" in src_prod.columns:
-        cols_top = [c for c in [
-            "NR_REGISTRO", "MARCA_COMERCIAL", "TEM_AGROFIT", "TEM_COMERCIALIZACAO",
-            "PRIMEIRO_ANO_COMERCIALIZACAO", "ULTIMO_ANO_COMERCIALIZACAO", "VENDA_TOTAL_PERIODO",
-        ] if c in src_prod.columns]
-        top_prod = (
-            src_prod[cols_top]
-            .sort_values("VENDA_TOTAL_PERIODO", ascending=False, na_position="last")
+    if df_evol_produtos is not None and not df_evol_produtos.empty and "TOTAL_PERIODO" in df_evol_produtos.columns:
+        cols_top = [c for c in ["NR_REGISTRO", "MARCA_COMERCIAL", "TOTAL_PERIODO"] if c in df_evol_produtos.columns]
+        rankings["Top20_Produtos"] = (
+            df_evol_produtos[cols_top]
+            .sort_values("TOTAL_PERIODO", ascending=False)
             .head(20)
             .reset_index(drop=True)
         )
-        rankings["Top20_Produtos"] = top_prod
-    elif not df_com_anual.empty and "VENDAS_TOTAIS" in df_com_anual.columns:
+    elif not df_com_produtos.empty and "VENDAS_TOTAIS" in df_com_produtos.columns:
         top_prod = (
-            df_com_anual.groupby(["NR_REGISTRO", "MARCA_COMERCIAL"], as_index=False)["VENDAS_TOTAIS"]
+            df_com_produtos.groupby(["NR_REGISTRO", "MARCA_COMERCIAL"], as_index=False)["VENDAS_TOTAIS"]
             .sum().sort_values("VENDAS_TOTAIS", ascending=False).head(20).reset_index(drop=True)
         )
         rankings["Top20_Produtos"] = top_prod
@@ -1832,54 +1463,118 @@ def montar_resumo_executivo(
 
 
 def montar_legenda() -> pd.DataFrame:
-    """Aba 00_Legenda: dicionario de colunas e premissas do modelo."""
     linhas = [
-        ("PREMISSA", "Perspectiva PRODUTO (PF)", "Volumes de produto formulado. Em multi-IA, o volume PF NAO e somado N vezes — usa-se first/max."),
-        ("PREMISSA", "Perspectiva IA", "Cada ingrediente ativo permanece em linha propria; volume ponderado = volume PF x PONDERACAO_IA."),
-        ("PREMISSA", "Colunas ORIGINAIS", "VENDAS_TOTAIS, VENDAS_CLIENTE, VENDAS_INDUSTRIA, PRODUCAO_NACIONAL, IMPORTACAO, EXPORTACAO, ESTOQUE_* — valores da planilha, sem ponderacao."),
-        ("PREMISSA", "Colunas PONDERADAS", "VENDA_PONDERADA_IA / VENDA_ESTIMADA_IA e demais *_PONDERAD*_IA = original x teor de IA. Nunca sobrescrevem as originais."),
-        ("PREMISSA", "Chave de cruzamento", "NR_REGISTRO normalizado (remove MAPA/IBAMA, pontuacao e zeros a esquerda) -> _CHAVE_REGISTRO."),
-        ("PREMISSA", "Unidades", "Volumes conforme a base de comercializacao (em geral toneladas ou equivalente declarado na origem). Conferir arquivo IBAMA/MAPA."),
-        ("ABA", "00_Resumo", "KPIs, qualidade do match (registros e volume) e rankings top."),
+        ("PREMISSA", "Perspectiva PRODUTO (PF)",
+         "Volumes de produto formulado. Em multi-IA, o volume PF NAO e somado N vezes — usa-se first/max."),
+        ("PREMISSA", "Perspectiva IA",
+         "Cada ingrediente ativo permanece em linha propria; volume ponderado = volume PF x PONDERACAO_IA."),
+        ("PREMISSA", "Colunas ORIGINAIS",
+         "VENDAS_TOTAIS, VENDAS_CLIENTE, VENDAS_INDUSTRIA, PRODUCAO_NACIONAL, IMPORTACAO, EXPORTACAO, ESTOQUE_* — valores da planilha, sem ponderacao."),
+        ("PREMISSA", "Colunas PONDERADAS",
+         "VENDA_PONDERADA_IA / VENDA_ESTIMADA_IA e demais *_PONDERAD*_IA = original x teor de IA. Nunca sobrescrevem as originais."),
+        ("PREMISSA", "Chave de cruzamento",
+         "NR_REGISTRO normalizado (remove MAPA/IBAMA, pontuacao e zeros a esquerda) -> _CHAVE_REGISTRO."),
+        ("PREMISSA", "Unidades",
+         "Volumes conforme a base de comercializacao. Conferir arquivo IBAMA/MAPA de origem."),
+        ("PREMISSA", "Regional",
+         "Formato LONGO (Ano em linha). Multi-IA: max do volume PF por Registro x Ano x UF."),
+        ("ABA", "00_Resumo", "KPIs, qualidade do match e rankings top."),
         ("ABA", "00_Legenda", "Este dicionario."),
-        ("ABA", "01_Produtos", "1 linha por registro: cadastro Agrofit + NUM_CULTURAS/PRAGAS + flags TEM_AGROFIT/TEM_COMERCIALIZACAO + anos wide + TOTAL_PERIODO."),
-        ("ABA", "02_Comerc_Produto", "Fato PF: Registro x Ano (volumes originais de produto formulado)."),
-        ("ABA", "03_Comerc_IA", "Fato IA: Registro x Ano x IA. Colunas originais (PF da linha) + colunas ponderadas desta IA + STATUS_CALCULO_IA."),
-        ("ABA", "04_Comerc_UF", "Vendas PF por Registro x Ano x UF (deduplicado com max em multi-IA)."),
-        ("ABA", "05_IA_Anual", "Agregacao ANO x INGREDIENTE_ATIVO (volumes ponderados de IA)."),
-        ("ABA", "06_IA_UF", "Estimativa de IA por UF = venda PF da UF x ponderacao da IA."),
-        ("ABA", "07_IA_Resumo", "1 linha por IA: metricas do periodo + contagens Agrofit + evolucao anual wide."),
-        ("ABA", "08_Evol_Produtos_Anual", "WIDE produto x ano (volume PF) + TOTAL_PERIODO. Paralela a evolucao de IA; ideal para graficos de linhas."),
-        ("ABA", "09_Agrofit_Sem_Vendas", "Registros presentes no Agrofit sem comercializacao no periodo."),
+        ("ABA", "01_Resumo_Agrofit",
+         "1 linha por registro: cadastro Agrofit + NUM_CULTURAS/PRAGAS + principais culturas/pragas."),
+        ("ABA", "02_Comercializacao_Produtos",
+         "Fato PF: Registro x Ano (volumes originais de produto formulado + resumo de IAs)."),
+        ("ABA", "03_Evolucao_Produtos",
+         "WIDE produto x ano (volume PF) + TOTAL_PERIODO. Ideal para graficos de evolucao."),
+        ("ABA", "04_Comercializacao_IA",
+         "Fato IA: Registro x Ano x IA. Originais PF da linha + ponderados desta IA + STATUS_CALCULO_IA."),
+        ("ABA", "05_Vendas_IA",
+         "Agregacao IA x Ano (volumes ponderados de IA + contagens de produtos/registros)."),
+        ("ABA", "06_Evolucao_IA",
+         "WIDE IA x ano (volume ponderado) + TOTAL_PERIODO. Alias conceitual: Vendas_IA_Evolucao."),
+        ("ABA", "07_Comerc_Regional_Produtos",
+         "Vendas PF por Registro x Ano x UF (deduplicado com max em multi-IA)."),
+        ("ABA", "08_Comerc_Regional_IA",
+         "Estimativa de IA por UF = venda PF da UF x ponderacao da IA."),
+        ("ABA", "09_Agrofit_Sem_Vendas", "Registros Agrofit sem comercializacao no periodo."),
         ("ABA", "10_Vendas_Sem_Agrofit", "Linhas de comercializacao sem correspondencia no Agrofit."),
-        ("COLUNA", "VENDA_PONDERADA_IA", "Quantidade efetiva de ingrediente ativo (volume PF x teor). Alias: VENDA_ESTIMADA_IA."),
-        ("COLUNA", "STATUS_CALCULO_IA", "CALCULADO | SEM_PONDERACAO | UNIDADE_INCOMPATIVEL | DADO_AUSENTE."),
-        ("COLUNA", "TEM_AGROFIT / TEM_COMERCIALIZACAO", "Flags SIM/NAO de cobertura do cruzamento na dimensao de produtos."),
-        ("COLUNA", "TOTAL_PERIODO / VENDA_TOTAL_PERIODO", "Soma dos volumes no horizonte de anos carregados."),
-        ("NOTA", "Agrofit_Uso removida", "Cultura e praga por registro permanecem na base Agrofit de origem; nao sao mais copiadas para o relatorio."),
+        ("COLUNA", "VENDA_PONDERADA_IA",
+         "Quantidade efetiva de ingrediente ativo (volume PF x teor). Alias: VENDA_ESTIMADA_IA."),
+        ("COLUNA", "VENDA_TOTAL_PF_ASSOCIADA",
+         "Soma de volumes PF das linhas daquele IA (NAO e volume de IA; rotulo explicito para evitar confusao)."),
+        ("COLUNA", "STATUS_CALCULO_IA",
+         "CALCULADO | SEM_PONDERACAO | UNIDADE_INCOMPATIVEL | DADO_AUSENTE."),
+        ("COLUNA", "NUM_LINHAS_ORIGEM",
+         "Quantidade de linhas da base bruta consolidadas no Registro x Ano (indica multi-IA)."),
+        ("COLUNA", "TOTAL_PERIODO", "Soma dos volumes no horizonte de anos carregados."),
     ]
     return pd.DataFrame(linhas, columns=["TIPO", "ITEM", "DESCRICAO"])
 
 
 # =============================================================================
-# GERACAO DO EXCEL FINAL
+# GERACAO DO EXCEL
 # =============================================================================
 
 ESTILO_CABECALHO_FONTE = Font(bold=True, color="FFFFFF", size=11)
 ESTILO_CABECALHO_FUNDO = PatternFill("solid", fgColor="2E5B34")
 ESTILO_AVISO_FONTE = Font(bold=True, color="9C4221", italic=True)
 ESTILO_AVISO_FUNDO = PatternFill("solid", fgColor="FFF3CD")
+LIMITE_LINHAS_TABELA_EXCEL = 900_000
 
-LIMITE_LINHAS_TABELA_EXCEL = 900_000  # margem de seguranca abaixo do limite do Excel
+# Caracteres de controle ilegais em XML/xlsx (exceto tab, LF, CR)
+_RE_XML_ILLEGAL = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x84\x86-\x9F\uFDD0-\uFDEF"
+    r"\uFFFE\uFFFF]"
+)
 
 
-def _escrever_dataframe_em_aba(ws, df: pd.DataFrame, aviso_topo: Optional[str] = None, nome_tabela: Optional[str] = None):
+def _sanitizar_valor_excel(val: Any) -> Any:
+    """Converte valores para tipos aceitos pelo Excel/openpyxl, sem corromper o XML."""
+    if val is None:
+        return None
+    if isinstance(val, (bool, np.bool_)):
+        return bool(val)
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (int,)):
+        return val
+    if isinstance(val, (np.floating, float)):
+        f = float(val)
+        if np.isnan(f) or np.isinf(f):
+            return None
+        return f
+    if pd.isna(val):
+        return None
+    if isinstance(val, (pd.Timestamp, datetime)):
+        try:
+            if pd.isna(val):
+                return None
+            return val.to_pydatetime() if hasattr(val, "to_pydatetime") else val
+        except Exception:
+            return str(val)
+    # Strings e demais: remove caracteres ilegais em XML
+    s = str(val)
+    if _RE_XML_ILLEGAL.search(s):
+        s = _RE_XML_ILLEGAL.sub("", s)
+    # Excel limita celulas a ~32k caracteres
+    if len(s) > 32000:
+        s = s[:31997] + "..."
+    return s
+
+
+def _escrever_dataframe_em_aba(
+    ws, df: pd.DataFrame, aviso_topo: Optional[str] = None, nome_tabela: Optional[str] = None
+):
+    """Escreve um DataFrame em uma aba, de forma segura para o Excel abrir sem reparo."""
     linha_inicio = 1
+    n_cols = max(len(df.columns), 1) if df is not None and not df.empty else 1
+
     if aviso_topo:
-        ws.cell(row=1, column=1, value=aviso_topo)
-        ws.cell(row=1, column=1).font = ESTILO_AVISO_FONTE
-        ws.cell(row=1, column=1).fill = ESTILO_AVISO_FUNDO
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(len(df.columns), 1))
+        cell = ws.cell(row=1, column=1, value=_sanitizar_valor_excel(aviso_topo))
+        cell.font = ESTILO_AVISO_FONTE
+        cell.fill = ESTILO_AVISO_FUNDO
+        if n_cols > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
         ws.row_dimensions[1].height = 30
         linha_inicio = 3
 
@@ -1888,6 +1583,20 @@ def _escrever_dataframe_em_aba(ws, df: pd.DataFrame, aviso_topo: Optional[str] =
         return
 
     df_out = df.copy()
+    # Garante nomes de coluna unicos e strings limpas (Excel Table exige cabecalhos unicos)
+    cols_limpos = []
+    vistos = {}
+    for c in df_out.columns:
+        nome = _sanitizar_valor_excel(str(c)) or "COL"
+        nome = str(nome).strip() or "COL"
+        if nome in vistos:
+            vistos[nome] += 1
+            nome = f"{nome}_{vistos[nome]}"
+        else:
+            vistos[nome] = 0
+        cols_limpos.append(nome)
+    df_out.columns = cols_limpos
+
     if len(df_out) > LIMITE_LINHAS_TABELA_EXCEL:
         df_out = df_out.head(LIMITE_LINHAS_TABELA_EXCEL)
 
@@ -1895,41 +1604,50 @@ def _escrever_dataframe_em_aba(ws, df: pd.DataFrame, aviso_topo: Optional[str] =
         c = ws.cell(row=linha_inicio, column=j, value=str(col))
         c.font = ESTILO_CABECALHO_FONTE
         c.fill = ESTILO_CABECALHO_FUNDO
-        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
 
     for i, (_, row) in enumerate(df_out.iterrows(), start=linha_inicio + 1):
         for j, val in enumerate(row, start=1):
-            if pd.isna(val):
-                val = None
-            elif isinstance(val, (np.integer,)):
-                val = int(val)
-            elif isinstance(val, (np.floating,)):
-                val = float(val)
-            ws.cell(row=i, column=j, value=val)
+            ws.cell(row=i, column=j, value=_sanitizar_valor_excel(val))
 
-    ws.freeze_panes = ws.cell(row=linha_inicio + 1, column=1)
+    # freeze_panes como string (mais compativel entre versoes do openpyxl)
+    ws.freeze_panes = f"A{linha_inicio + 1}"
 
     ultima_linha = linha_inicio + len(df_out)
     ultima_coluna = len(df_out.columns)
-    if nome_tabela and len(df_out) > 0 and ultima_linha > linha_inicio:
+    # Tabela formatada so se houver ao menos 1 linha de dados alem do cabecalho
+    if (
+        nome_tabela
+        and len(df_out) > 0
+        and ultima_linha > linha_inicio
+        and ultima_coluna >= 1
+    ):
         try:
-            ref = f"{get_column_letter(1)}{linha_inicio}:{get_column_letter(ultima_coluna)}{ultima_linha}"
-            tabela = Table(displayName=nome_tabela, ref=ref)
+            # displayName: letra/underscore, sem espacos, unico no workbook
+            nome_tab_limpo = re.sub(r"[^A-Za-z0-9_]", "", str(nome_tabela))
+            if not nome_tab_limpo or nome_tab_limpo[0].isdigit():
+                nome_tab_limpo = "T" + nome_tab_limpo
+            ref = (
+                f"{get_column_letter(1)}{linha_inicio}:"
+                f"{get_column_letter(ultima_coluna)}{ultima_linha}"
+            )
+            tabela = Table(displayName=nome_tab_limpo, ref=ref)
             tabela.tableStyleInfo = TableStyleInfo(
                 name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False
             )
             ws.add_table(tabela)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             LOGGER.warning("Nao foi possivel criar tabela formatada em %s: %s", nome_tabela, e)
 
-    for j, col in enumerate(df_out.columns, start=1):
+    for j in range(1, ultima_coluna + 1):
         try:
             maior = max(
-                [len(str(col))] + [len(str(v)) for v in df_out.iloc[:, j - 1].head(200)]
+                [len(str(df_out.columns[j - 1]))]
+                + [len(str(v)) for v in df_out.iloc[:, j - 1].head(100)]
             )
         except Exception:
-            maior = 15
-        ws.column_dimensions[get_column_letter(j)].width = min(max(maior + 2, 10), 45)
+            maior = 12
+        ws.column_dimensions[get_column_letter(j)].width = min(max(maior + 2, 10), 40)
 
 
 def gerar_excel(
@@ -1942,27 +1660,27 @@ def gerar_excel(
     wb = Workbook()
     wb.remove(wb.active)
 
+    # Nomes de aba <= 31 caracteres (limite do Excel). Ultrapassar corrompe o arquivo.
     # ---- 00_Resumo ----
     ws = wb.create_sheet("00_Resumo")
     _escrever_dataframe_em_aba(ws, df_resumo, nome_tabela="TabResumo")
-    linha_atual = len(df_resumo) + 4
+    # Rankings abaixo do bloco de indicadores (fora da Table)
+    linha_atual = (len(df_resumo) if df_resumo is not None and not df_resumo.empty else 0) + 4
     for nome_ranking, df_rank in rankings.items():
-        ws.cell(row=linha_atual, column=1, value=nome_ranking.replace("_", " ")).font = Font(bold=True, size=12)
+        if df_rank is None or df_rank.empty:
+            continue
+        ws.cell(row=linha_atual, column=1, value=_sanitizar_valor_excel(nome_ranking.replace("_", " "))).font = Font(
+            bold=True, size=12
+        )
         linha_atual += 1
         for j, col in enumerate(df_rank.columns, start=1):
-            c = ws.cell(row=linha_atual, column=j, value=str(col))
+            c = ws.cell(row=linha_atual, column=j, value=_sanitizar_valor_excel(str(col)))
             c.font = ESTILO_CABECALHO_FONTE
             c.fill = ESTILO_CABECALHO_FUNDO
         linha_atual += 1
         for _, row in df_rank.iterrows():
             for j, val in enumerate(row, start=1):
-                if pd.isna(val):
-                    val = None
-                elif isinstance(val, (np.integer,)):
-                    val = int(val)
-                elif isinstance(val, (np.floating,)):
-                    val = float(val)
-                ws.cell(row=linha_atual, column=j, value=val)
+                ws.cell(row=linha_atual, column=j, value=_sanitizar_valor_excel(val))
             linha_atual += 1
         linha_atual += 2
 
@@ -1974,21 +1692,8 @@ def gerar_excel(
         nome_tabela="TabLegenda",
     )
 
-    # ---- Abas numeradas principais (estrutura enxuta) ----
-    abas_numeradas = [
-        ("01_Produtos", "Produtos", "TabProdutos"),
-        ("02_Comerc_Produto", "Comercializacao_Produto", "TabComercProduto"),
-        ("03_Comerc_IA", "Comercializacao_IA", "TabComercIA"),
-        ("04_Comerc_UF", "Comercializacao_UF", "TabComercUF"),
-        ("05_IA_Anual", "IA_Anual", "TabIAAnual"),
-        ("06_IA_UF", "IA_UF", "TabIAUF"),
-        ("07_IA_Resumo", "IA_Resumo", "TabIAResumo"),
-        ("08_Evol_Produtos_Anual", "Evolucao_Produtos_Anual", "TabEvolProdutosAnual"),
-        ("09_Agrofit_Sem_Vendas", "Agrofit_Sem_Comercializacao", "TabAgrofitSemVendas"),
-        ("10_Vendas_Sem_Agrofit", "Comercializacao_Sem_Agrofit", "TabVendasSemAgrofit"),
-    ]
-    fill_original = PatternFill("solid", fgColor="D6EAF8")   # azul claro = PF original
-    fill_ponderado = PatternFill("solid", fgColor="D5F5E3")  # verde claro = ponderado IA
+    fill_original = PatternFill("solid", fgColor="D6EAF8")
+    fill_ponderado = PatternFill("solid", fgColor="D5F5E3")
     cols_originais = {
         "ESTOQUE_INICIAL", "PRODUCAO_NACIONAL", "IMPORTACAO", "EXPORTACAO",
         "VENDAS_INDUSTRIA", "VENDAS_CLIENTE", "VENDAS_TOTAIS", "ESTOQUE_FINAL",
@@ -2001,21 +1706,36 @@ def gerar_excel(
         "PONDERACAO_IA",
     }
 
+    # nome_aba deve ter no maximo 31 caracteres
+    abas_numeradas = [
+        ("01_Resumo_Agrofit", "Resumo_Agrofit", "TabResumoAgrofit"),
+        ("02_Comercializacao_Produtos", "Comercializacao_Produtos", "TabComercProdutos"),
+        ("03_Evolucao_Produtos", "Evolucao_Produtos", "TabEvolProdutos"),
+        ("04_Comercializacao_IA", "Comercializacao_IA", "TabComercIA"),
+        ("05_Vendas_IA", "Vendas_IA", "TabVendasIA"),
+        ("06_Evolucao_IA", "Evolucao_IA", "TabEvolIA"),
+        ("07_Comerc_Regional_Produtos", "Comercializacao_Regional_Produtos", "TabRegProd"),
+        ("08_Comerc_Regional_IA", "Comercializacao_Regional_IA", "TabRegIA"),
+        ("09_Agrofit_Sem_Vendas", "Agrofit_Sem_Vendas", "TabAgrofitSemVendas"),
+        ("10_Vendas_Sem_Agrofit", "Vendas_Sem_Agrofit", "TabVendasSemAgrofit"),
+    ]
+
     for nome_aba, chave_tabela, nome_tab in abas_numeradas:
+        if len(nome_aba) > 31:
+            raise ValueError(f"Nome de aba excede 31 caracteres: {nome_aba!r} ({len(nome_aba)})")
         ws = wb.create_sheet(nome_aba)
-        aviso = None
-        if nome_aba == "03_Comerc_IA":
-            aviso = (
+        aviso_txt = None
+        if nome_aba == "04_Comercializacao_IA":
+            aviso_txt = (
                 "Azul claro = volumes ORIGINAIS (PF da linha). "
                 "Verde claro = volumes PONDERADOS pela IA (teor x PF). "
-                "Nao some volumes PF entre linhas da mesma IA multi-componente."
+                "Nao some volumes PF entre linhas da mesma formulacao multi-IA."
             )
         df_aba = tabelas.get(chave_tabela, pd.DataFrame())
-        _escrever_dataframe_em_aba(ws, df_aba, aviso_topo=aviso, nome_tabela=nome_tab)
+        _escrever_dataframe_em_aba(ws, df_aba, aviso_topo=aviso_txt, nome_tabela=nome_tab)
 
-        # Destaca cabecalhos de originais vs ponderados na aba IA
-        if nome_aba == "03_Comerc_IA" and df_aba is not None and not df_aba.empty:
-            header_row = 3 if aviso else 1
+        if nome_aba == "04_Comercializacao_IA" and df_aba is not None and not df_aba.empty:
+            header_row = 3 if aviso_txt else 1
             for j, col in enumerate(df_aba.columns, start=1):
                 cell = ws.cell(row=header_row, column=j)
                 if str(col) in cols_originais:
@@ -2025,160 +1745,14 @@ def gerar_excel(
                     cell.fill = fill_ponderado
                     cell.font = Font(bold=True, color="145A32")
 
+    caminho_saida.parent.mkdir(parents=True, exist_ok=True)
     wb.save(caminho_saida)
+    wb.close()
 
-
-
-def inserir_graficos(wb: Workbook, ws_graf, tabelas: Dict[str, pd.DataFrame]) -> None:
-    """Cria graficos baseados SOMENTE nas tabelas agregadas (nunca na
-    tabela Agrofit detalhada), conforme a regra de negocio do projeto."""
-    ws_graf.cell(row=1, column=1, value="Graficos gerados a partir das tabelas agregadas (nunca da tabela detalhada).").font = Font(bold=True, italic=True)
-
-    ancora_linha = 3
-    largura_bloco = 15
-
-    def _prep_aba_dados(nome_aba: str, df: pd.DataFrame) -> Optional[Any]:
-        if df is None or df.empty:
-            return None
-        ws = wb.create_sheet(nome_aba)
-        for j, col in enumerate(df.columns, start=1):
-            ws.cell(row=1, column=j, value=str(col))
-        for i, (_, row) in enumerate(df.iterrows(), start=2):
-            for j, val in enumerate(row, start=1):
-                if pd.isna(val):
-                    val = None
-                ws.cell(row=i, column=j, value=val)
-        ws.sheet_state = "hidden"
-        return ws
-
-    # 1) Evolucao das vendas totais por ano (produto PF)
-    df_com_anual = tabelas.get("Comercializacao_Anual", pd.DataFrame())
-    if not df_com_anual.empty and "ANO" in df_com_anual.columns and "VENDAS_TOTAIS" in df_com_anual.columns:
-        evol = df_com_anual.groupby("ANO", as_index=False)[["VENDAS_TOTAIS"]].sum().sort_values("ANO")
-        ws_dados = _prep_aba_dados("_dados_evol_anual", evol)
-        if ws_dados is not None:
-            chart = LineChart()
-            chart.title = "Evolucao das vendas totais por ano (produto PF)"
-            chart.y_axis.title = "Volume"
-            chart.x_axis.title = "Ano"
-            dados = Reference(ws_dados, min_col=2, max_col=2, min_row=1, max_row=len(evol) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(evol) + 1)
-            chart.add_data(dados, titles_from_data=True)
-            chart.set_categories(categorias)
-            ws_graf.add_chart(chart, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
-
-    # Evolucao da venda estimada de IA (a partir de IA_Anual)
-    df_ia_chart = tabelas.get("IA_Anual", pd.DataFrame())
-    col_ia_vol = next(
-        (c for c in ["VENDA_PONDERADA_IA", "VENDA_ESTIMADA_IA", "VENDA_TOTAL"] if c in df_ia_chart.columns),
-        None,
-    )
-    if not df_ia_chart.empty and "ANO" in df_ia_chart.columns and col_ia_vol:
-        evol_ia = df_ia_chart.groupby("ANO", as_index=False)[[col_ia_vol]].sum().sort_values("ANO")
-        ws_dados = _prep_aba_dados("_dados_evol_ia", evol_ia)
-        if ws_dados is not None:
-            chart2 = LineChart()
-            chart2.title = "Evolucao da venda estimada de IA"
-            dados2 = Reference(ws_dados, min_col=2, max_col=2, min_row=1, max_row=len(evol_ia) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(evol_ia) + 1)
-            chart2.add_data(dados2, titles_from_data=True)
-            chart2.set_categories(categorias)
-            ws_graf.add_chart(chart2, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
-
-    # 2) Top 20 ingredientes ativos
-    df_ia_anual = tabelas.get("IA_Anual", pd.DataFrame())
-    if not df_ia_anual.empty:
-        top_ia = df_ia_anual.groupby("INGREDIENTE_ATIVO", as_index=False)["VENDA_TOTAL"].sum().sort_values("VENDA_TOTAL", ascending=False).head(20)
-        ws_dados = _prep_aba_dados("_dados_top_ia", top_ia)
-        if ws_dados is not None:
-            chart = BarChart()
-            chart.title = "Top 20 ingredientes ativos"
-            chart.type = "bar"
-            dados = Reference(ws_dados, min_col=2, min_row=1, max_row=len(top_ia) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(top_ia) + 1)
-            chart.add_data(dados, titles_from_data=True)
-            chart.set_categories(categorias)
-            ws_graf.add_chart(chart, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
-
-        # 4) Evolucao dos principais IA (top 5) ao longo dos anos
-        top5_nomes = top_ia["INGREDIENTE_ATIVO"].head(5).tolist()
-        evol_top5 = df_ia_anual[df_ia_anual["INGREDIENTE_ATIVO"].isin(top5_nomes)]
-        if not evol_top5.empty:
-            pivot = evol_top5.pivot_table(index="ANO", columns="INGREDIENTE_ATIVO", values="VENDA_TOTAL", aggfunc="sum").fillna(0).reset_index().sort_values("ANO")
-            ws_dados = _prep_aba_dados("_dados_evol_top5_ia", pivot)
-            if ws_dados is not None:
-                chart = LineChart()
-                chart.title = "Evolucao dos principais ingredientes ativos"
-                dados = Reference(ws_dados, min_col=2, max_col=pivot.shape[1], min_row=1, max_row=len(pivot) + 1)
-                categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(pivot) + 1)
-                chart.add_data(dados, titles_from_data=True)
-                chart.set_categories(categorias)
-                ws_graf.add_chart(chart, f"A{ancora_linha}")
-                ancora_linha += largura_bloco
-
-    # 3) Top 20 produtos
-    if not df_com_anual.empty and "MARCA_COMERCIAL" in df_com_anual.columns:
-        top_prod = df_com_anual.groupby("MARCA_COMERCIAL", as_index=False)["VENDAS_TOTAIS"].sum().sort_values("VENDAS_TOTAIS", ascending=False).head(20)
-        ws_dados = _prep_aba_dados("_dados_top_prod", top_prod)
-        if ws_dados is not None:
-            chart = BarChart()
-            chart.title = "Top 20 produtos"
-            chart.type = "bar"
-            dados = Reference(ws_dados, min_col=2, min_row=1, max_row=len(top_prod) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(top_prod) + 1)
-            chart.add_data(dados, titles_from_data=True)
-            chart.set_categories(categorias)
-            ws_graf.add_chart(chart, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
-
-    # 5) Vendas por regiao / 6) Vendas por UF
-    df_com_uf = tabelas.get("Comercializacao_UF", pd.DataFrame())
-    if not df_com_uf.empty:
-        por_regiao = df_com_uf.groupby("REGIAO", as_index=False)["VENDA"].sum().sort_values("VENDA", ascending=False)
-        ws_dados = _prep_aba_dados("_dados_regiao", por_regiao)
-        if ws_dados is not None:
-            chart = BarChart()
-            chart.title = "Vendas por regiao"
-            dados = Reference(ws_dados, min_col=2, min_row=1, max_row=len(por_regiao) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(por_regiao) + 1)
-            chart.add_data(dados, titles_from_data=True)
-            chart.set_categories(categorias)
-            ws_graf.add_chart(chart, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
-
-        por_uf = df_com_uf.groupby("UF", as_index=False)["VENDA"].sum().sort_values("VENDA", ascending=False).head(10)
-        ws_dados = _prep_aba_dados("_dados_uf", por_uf)
-        if ws_dados is not None:
-            chart = BarChart()
-            chart.title = "Vendas por UF (Top 10)"
-            dados = Reference(ws_dados, min_col=2, min_row=1, max_row=len(por_uf) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(por_uf) + 1)
-            chart.add_data(dados, titles_from_data=True)
-            chart.set_categories(categorias)
-            ws_graf.add_chart(chart, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
-
-    # 7) Participacao dos principais IA (pizza aproximada via barra, mais legivel em bases grandes)
-    if not df_ia_anual.empty:
-        participacao = df_ia_anual.groupby("INGREDIENTE_ATIVO", as_index=False)["VENDA_TOTAL"].sum().sort_values("VENDA_TOTAL", ascending=False).head(10)
-        ws_dados = _prep_aba_dados("_dados_participacao_ia", participacao)
-        if ws_dados is not None:
-            chart = BarChart()
-            chart.title = "Participacao dos principais IA (Top 10)"
-            chart.type = "bar"
-            dados = Reference(ws_dados, min_col=2, min_row=1, max_row=len(participacao) + 1)
-            categorias = Reference(ws_dados, min_col=1, min_row=2, max_row=len(participacao) + 1)
-            chart.add_data(dados, titles_from_data=True)
-            chart.set_categories(categorias)
-            ws_graf.add_chart(chart, f"A{ancora_linha}")
-            ancora_linha += largura_bloco
 
 
 # =============================================================================
-# ORQUESTRACAO PRINCIPAL
+# ORQUESTRACAO
 # =============================================================================
 
 def preparar_pastas() -> None:
@@ -2194,12 +1768,12 @@ def main() -> None:
     titulo("ANALISE INTEGRADA AGROFIT x COMERCIALIZACAO DE AGROTOXICOS")
     LOGGER.info("Execucao iniciada em %s", datetime.now().isoformat())
 
-    # ---------------- 1) Localizar e carregar Agrofit ----------------
+    # 1) Agrofit
     caminho_agrofit = localizar_arquivo_agrofit()
     if caminho_agrofit is None:
         erro(
             f"Arquivo do Agrofit nao encontrado em {DADOS_DIR}. "
-            f"Coloque o arquivo '{ARQUIVO_AGROFIT_PADRAO}' dentro da pasta 'dados/' e execute novamente."
+            f"Coloque '{ARQUIVO_AGROFIT_PADRAO}' na pasta 'dados/' e execute novamente."
         )
         if os.environ.get("AGROFIT_NO_INPUT"):
             return
@@ -2210,18 +1784,18 @@ def main() -> None:
         df_agrofit = carregar_agrofit(caminho_agrofit)
 
     if df_agrofit.empty:
-        erro("A base do Agrofit foi carregada, porem esta vazia ou sem registros validos. Encerrando.")
+        erro("Base Agrofit vazia ou sem registros validos. Encerrando.")
         if os.environ.get("AGROFIT_NO_INPUT"):
             return
         input("\nPressione Enter para sair...")
         return
 
-    # ---------------- 2) Detectar e carregar comercializacao ----------------
+    # 2) Comercializacao
     arquivos_com = detectar_arquivos_comercializacao(caminho_agrofit)
     if not arquivos_com:
         aviso(
-            f"Nenhum arquivo de comercializacao encontrado em {DADOS_DIR}. "
-            "O relatorio sera gerado apenas com as informacoes regulatorias do Agrofit."
+            f"Nenhum arquivo de comercializacao em {DADOS_DIR}. "
+            "Relatorio apenas com informacoes regulatorias do Agrofit."
         )
     else:
         print(f"\n{len(arquivos_com)} arquivo(s) de comercializacao detectado(s):")
@@ -2234,92 +1808,86 @@ def main() -> None:
     if not df_vendas_bruto.empty:
         with Cronometro("Preparar campos numericos de comercializacao"):
             df_vendas_bruto = preparar_numericos_comercializacao(df_vendas_bruto)
-        # Normaliza nomes de IA na base bruta para agregacoes posteriores
         if "INGREDIENTE_ATIVO" in df_vendas_bruto.columns:
             df_vendas_bruto["INGREDIENTE_ATIVO"] = df_vendas_bruto["INGREDIENTE_ATIVO"].apply(
                 lambda v: v if pd.isna(v) else str(v).strip()
             )
 
-    # ---------------- 3) Construcao das tabelas analiticas ----------------
-    with Cronometro("Montar dimensao Produtos (cadastro Agrofit)"):
-        df_produtos = montar_tabela_produtos(df_agrofit)
-        ok(f"{len(df_produtos):,} registros/produtos unicos no Agrofit")
+    # 3) Tabelas analiticas
+    with Cronometro("01_Resumo_Agrofit"):
+        df_resumo_agrofit = montar_resumo_agrofit(df_agrofit)
+        ok(f"{len(df_resumo_agrofit):,} registros unicos no Agrofit")
 
-    with Cronometro("Montar 02_Comerc_Produto (Registro x Ano)"):
-        df_com_produto = montar_comercializacao_produto(df_vendas_bruto, df_produtos)
-        ok(f"{len(df_com_produto):,} linhas (produto consolidado)")
+    with Cronometro("02_Comercializacao_Produtos"):
+        df_com_produtos = montar_comercializacao_produtos(df_vendas_bruto, df_resumo_agrofit)
+        ok(f"{len(df_com_produtos):,} linhas (produto x ano)")
 
-    with Cronometro("Montar 03_Comerc_IA (Registro x Ano x IA)"):
-        df_com_ia = montar_comercializacao_ia(df_vendas_bruto, df_produtos)
-        ok(f"{len(df_com_ia):,} linhas (IA separada)")
+    with Cronometro("03_Evolucao_Produtos"):
+        df_evol_produtos = montar_evolucao_produtos(df_com_produtos)
+        ok(f"{len(df_evol_produtos):,} produtos com serie historica")
 
-    with Cronometro("Montar 04_Comerc_UF"):
-        df_com_uf = montar_comercializacao_uf(df_vendas_bruto, df_produtos)
-        ok(f"{len(df_com_uf):,} linhas (Registro x Ano x UF)")
+    with Cronometro("04_Comercializacao_IA"):
+        df_com_ia = montar_comercializacao_ia(df_vendas_bruto, df_resumo_agrofit)
+        ok(f"{len(df_com_ia):,} linhas (registro x ano x IA)")
 
-    with Cronometro("Montar 05_IA_Anual"):
-        # Aplica normalizacao de IA antes de agregar
-        if not df_com_ia.empty and "INGREDIENTE_ATIVO" in df_com_ia.columns:
-            df_com_ia = df_com_ia.copy()
-            df_com_ia["_IA_RAW"] = df_com_ia["INGREDIENTE_ATIVO"]
-            # Mantem o nome original na linha; agregacao em montar_ia_anual usa o texto
-            # A unificacao forte ocorre em montar_ia_resumo_evol
-        df_ia_anual = montar_ia_anual(df_com_ia)
-        ok(f"{len(df_ia_anual):,} linhas ANO x IA")
+    with Cronometro("05_Vendas_IA"):
+        df_vendas_ia = montar_vendas_ia(df_com_ia)
+        ok(f"{len(df_vendas_ia):,} linhas (IA x ano)")
 
-    with Cronometro("Montar 06_IA_UF"):
-        df_ia_uf = montar_ia_uf(df_com_uf, df_com_ia)
+    with Cronometro("06_Evolucao_IA"):
+        df_evol_ia = montar_evolucao_ia(df_vendas_ia)
+        ok(f"{len(df_evol_ia):,} ingredientes ativos com serie historica")
 
-    with Cronometro("Montar 01_Produtos (cadastro + KPIs + evolucao anual)"):
-        df_produtos_completo = montar_produtos_completo(df_agrofit, df_produtos, df_com_produto)
-        ok(f"{len(df_produtos_completo):,} produtos (Agrofit U vendas)")
+    with Cronometro("07_Comercializacao_Regional_Produtos"):
+        df_com_uf = montar_comercializacao_regional_produtos(df_vendas_bruto, df_resumo_agrofit)
+        ok(f"{len(df_com_uf):,} linhas (registro x ano x UF)")
 
-    with Cronometro("Montar 08_Evol_Produtos_Anual (wide produto x ano)"):
-        df_evol_produtos = montar_evolucao_produtos_anual(df_com_produto)
-        ok(f"{len(df_evol_produtos):,} produtos com serie historica anual")
+    with Cronometro("08_Comercializacao_Regional_IA"):
+        df_ia_uf = montar_comercializacao_regional_ia(df_com_uf, df_com_ia)
+        ok(f"{len(df_ia_uf):,} linhas (IA x ano x UF)")
 
-    with Cronometro("Montar 07_IA_Resumo (resumo + evolucao anual)"):
-        df_ia_resumo = montar_ia_resumo_evol(df_agrofit, df_com_ia, df_ia_anual)
-        ok(f"{len(df_ia_resumo):,} ingredientes ativos")
+    with Cronometro("09_Agrofit_Sem_Vendas"):
+        df_agrofit_sem = montar_agrofit_sem_vendas(df_resumo_agrofit, df_com_produtos)
+        ok(f"{len(df_agrofit_sem):,} registros sem comercializacao")
 
-    with Cronometro("Montar 09_Agrofit_Sem_Vendas"):
-        df_agrofit_sem_com = montar_agrofit_sem_comercializacao(df_produtos, df_com_produto)
-        ok(f"{len(df_agrofit_sem_com):,} registros sem comercializacao encontrada")
+    with Cronometro("10_Vendas_Sem_Agrofit"):
+        df_vendas_sem = montar_vendas_sem_agrofit(df_com_produtos, df_resumo_agrofit)
+        if len(df_vendas_sem) > 0:
+            aviso(f"{len(df_vendas_sem):,} registros de comercializacao sem match no Agrofit")
 
-    with Cronometro("Montar 10_Vendas_Sem_Agrofit"):
-        df_com_sem_agro = montar_comercializacao_sem_agrofit(df_com_produto, df_produtos)
-        if len(df_com_sem_agro) > 0:
-            aviso(f"{len(df_com_sem_agro):,} registros de comercializacao nao encontrados no Agrofit")
-
-    with Cronometro("Montar metricas de validacao"):
+    with Cronometro("Validacao e resumo executivo"):
         df_validacao = montar_validacao(
-            df_agrofit, df_produtos, df_com_produto, df_agrofit_sem_com, df_com_sem_agro
+            df_resumo_agrofit, df_com_produtos, df_agrofit_sem, df_vendas_sem
         )
-
-    with Cronometro("Montar resumo executivo e rankings"):
         df_resumo, rankings = montar_resumo_executivo(
-            df_agrofit, df_produtos, df_com_produto, df_com_uf, df_ia_anual,
+            df_agrofit, df_resumo_agrofit, df_com_produtos, df_com_uf, df_vendas_ia,
             df_validacao=df_validacao,
-            df_produtos_completo=df_produtos_completo,
+            df_evol_produtos=df_evol_produtos,
         )
         df_legenda = montar_legenda()
 
+    # Flags de cobertura no Resumo_Agrofit
+    if not df_resumo_agrofit.empty:
+        chaves_com = set(df_com_produtos["_CHAVE_REGISTRO"].unique()) if not df_com_produtos.empty else set()
+        df_resumo_agrofit = df_resumo_agrofit.copy()
+        df_resumo_agrofit["TEM_COMERCIALIZACAO"] = df_resumo_agrofit["_CHAVE_REGISTRO"].apply(
+            lambda k: "SIM" if k in chaves_com else "NAO"
+        )
+
     tabelas = {
-        "Produtos": df_produtos_completo.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
-        "Comercializacao_Produto": df_com_produto.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
-        "Comercializacao_IA": df_com_ia.drop(columns=["_CHAVE_REGISTRO", "_IA_RAW"], errors="ignore"),
-        "Comercializacao_UF": df_com_uf.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
-        "IA_Anual": df_ia_anual,
-        "IA_UF": df_ia_uf,
-        "IA_Resumo": df_ia_resumo,
-        "Evolucao_Produtos_Anual": df_evol_produtos,
-        "Agrofit_Sem_Comercializacao": df_agrofit_sem_com,
-        "Comercializacao_Sem_Agrofit": df_com_sem_agro,
-        # alias interno
-        "Comercializacao_Anual": df_com_produto.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
+        "Resumo_Agrofit": df_resumo_agrofit.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
+        "Comercializacao_Produtos": df_com_produtos.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
+        "Evolucao_Produtos": df_evol_produtos,
+        "Comercializacao_IA": df_com_ia.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
+        "Vendas_IA": df_vendas_ia,
+        "Evolucao_IA": df_evol_ia,
+        "Comercializacao_Regional_Produtos": df_com_uf.drop(columns=["_CHAVE_REGISTRO"], errors="ignore"),
+        "Comercializacao_Regional_IA": df_ia_uf,
+        "Agrofit_Sem_Vendas": df_agrofit_sem,
+        "Vendas_Sem_Agrofit": df_vendas_sem,
     }
 
-    # ---------------- 4) Geracao do Excel ----------------
+    # 4) Excel
     caminho_saida = SAIDA_DIR / ARQUIVO_SAIDA
     with Cronometro(f"Gerar arquivo Excel final ({ARQUIVO_SAIDA})"):
         gerar_excel(caminho_saida, tabelas, df_resumo, rankings, df_legenda=df_legenda)
@@ -2332,18 +1900,18 @@ def main() -> None:
     print(f"Log detalhado  : {LOGS_DIR / ARQUIVO_LOG}")
     print(f"Tempo total    : {tempo_legivel(tempo_total)}\n")
 
-    pct = df_validacao.loc[
-        df_validacao["INDICADOR"] == "PERCENTUAL_CORRESPONDENCIA_REGISTROS", "VALOR"
-    ]
-    if len(pct):
-        print(f"Percentual de correspondencia (registros): {pct.iloc[0]}%")
-    pct_vol = df_validacao.loc[
-        df_validacao["INDICADOR"] == "PERCENTUAL_VOLUME_COM_MATCH", "VALOR"
-    ]
-    if len(pct_vol):
-        print(f"Percentual de correspondencia (volume PF): {pct_vol.iloc[0]}%")
+    if not df_validacao.empty:
+        pct = df_validacao.loc[
+            df_validacao["INDICADOR"] == "PERCENTUAL_CORRESPONDENCIA_REGISTROS", "VALOR"
+        ]
+        if len(pct):
+            print(f"Percentual de correspondencia (registros): {pct.iloc[0]}%")
+        pct_vol = df_validacao.loc[
+            df_validacao["INDICADOR"] == "PERCENTUAL_VOLUME_COM_MATCH", "VALOR"
+        ]
+        if len(pct_vol):
+            print(f"Percentual de correspondencia (volume PF): {pct_vol.iloc[0]}%")
     print()
-
 
 
 if __name__ == "__main__":
@@ -2351,7 +1919,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         aviso("Interrompido pelo usuario.")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         erro(f"Erro inesperado: {e}")
         LOGGER.error("Erro inesperado: %s\n%s", e, traceback.format_exc())
         traceback.print_exc()
