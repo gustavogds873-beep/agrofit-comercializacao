@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-#  ANÁLISE AGROFIT — CULTURA / PRAGA / INGREDIENTE ATIVO / DOSE
+#  ANÁLISE AGROFIT — PRODUTOS ALTERNATIVOS
 # ================================================================
-#  Script completo e standalone para Windows / Linux / macOS
+#  Script completo e standalone para Windows / Linux / macOS / Colab
 #
 #  Funcionalidades (análises exclusivas da base Agrofit):
 #    1  Busca por CULTURA          → resumo pragas × IAs
@@ -18,12 +18,17 @@
 #  Requisitos (instalar uma vez):
 #    pip install pandas requests openpyxl unidecode rapidfuzz tqdm
 #
-#  Uso:
-#    python analise_agrofit.py
+#  Uso local:
+#    python analise_produtos_alternativos.py
 #
-#  Arquivos esperados na mesma pasta (ou informados no menu):
+#  Uso no Google Colab:
+#    - Defina AGROFIT_DADOS_DIR, AGROFIT_SAIDA_DIR (opcional AGROFIT_NO_INPUT=1)
+#    - Ou use o notebook Analise_Produtos_Alternativos.ipynb
+#
+#  Arquivos esperados:
 #    - agrofitprodutosformulados.csv  (baixado automaticamente se ausente)
 #
+#  Repositório: https://github.com/gustavogds873-beep/agrofit-comercializacao
 #  Autor base: Gustavo Gomes de Sousa
 # ================================================================
 
@@ -212,16 +217,90 @@ def smart_progress(iterable, total=None, desc="Processando", unit="it"):
 # Configuração global
 # ---------------------------------------------------------------------------
 
-# Pasta de trabalho = pasta do script (funciona no Windows com espaços/acentos)
-SCRIPT_DIR = Path(__file__).resolve().parent
-os.chdir(SCRIPT_DIR)
+# Pastas: suportam execução local e Google Colab via variáveis de ambiente
+#   AGROFIT_DADOS_DIR  → onde está / será baixado o CSV Agrofit
+#   AGROFIT_SAIDA_DIR  → onde gravar os resultados
+#   AGROFIT_LOGS_DIR   → (reservado)
+#   AGROFIT_NO_INPUT   → "1" força respostas padrão em prompts de download
+#
+# Prioridade de resolução:
+#   1. Variáveis de ambiente (AGROFIT_*)
+#   2. Detecção automática do Colab (/content/dados e /content/resultados)
+#   3. Pasta do script (execução local)
+
+def _detectar_colab() -> bool:
+    """Retorna True se estiver rodando no Google Colab."""
+    if Path("/content").is_dir():
+        try:
+            import google.colab  # noqa: F401
+            return True
+        except ImportError:
+            # Pasta /content existe (ambiente tipo Colab) mesmo sem o pacote
+            return Path("/content/dados").exists() or Path("/content/scripts").exists()
+    return False
+
+
+def _resolver_pastas():
+    """
+    Resolve DADOS_DIR, SAIDA_DIR, LOGS_DIR e CSV_LOCAL.
+    Pode ser chamada de novo no início de main() para pegar env vars
+    definidas logo antes do %run no notebook.
+    """
+    try:
+        script_file = Path(__file__).resolve()
+        script_dir = script_file.parent
+    except NameError:
+        script_dir = Path.cwd()
+
+    em_colab = _detectar_colab()
+
+    # Defaults: no Colab usa /content/{dados,resultados,logs}; local usa pasta do script
+    if em_colab:
+        default_dados = Path("/content/dados")
+        default_saida = Path("/content/resultados")
+        default_logs = Path("/content/logs")
+    else:
+        default_dados = script_dir
+        default_saida = script_dir
+        default_logs = script_dir / "logs"
+
+    dados = Path(os.environ.get("AGROFIT_DADOS_DIR", str(default_dados))).resolve()
+    saida = Path(os.environ.get("AGROFIT_SAIDA_DIR", str(default_saida))).resolve()
+    logs = Path(os.environ.get("AGROFIT_LOGS_DIR", str(default_logs))).resolve()
+    no_input = os.environ.get("AGROFIT_NO_INPUT", "").strip().lower() in (
+        "1", "true", "yes", "y", "sim"
+    )
+
+    dados.mkdir(parents=True, exist_ok=True)
+    saida.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+
+    csv_local = dados / "agrofitprodutosformulados.csv"
+
+    # Se o CSV ainda não está em dados/, procura em locais comuns do Colab
+    if not csv_local.exists():
+        candidatos = [
+            Path("/content/dados/agrofitprodutosformulados.csv"),
+            Path("/content/agrofitprodutosformulados.csv"),
+            script_dir / "agrofitprodutosformulados.csv",
+            Path.cwd() / "agrofitprodutosformulados.csv",
+        ]
+        for c in candidatos:
+            if c.exists() and c.stat().st_size > 1_000_000:
+                # Usa o caminho encontrado (não copia; apenas aponta)
+                csv_local = c
+                break
+
+    return script_dir, dados, saida, logs, no_input, str(csv_local)
+
+
+SCRIPT_DIR, DADOS_DIR, SAIDA_DIR, LOGS_DIR, NO_INPUT, CSV_LOCAL = _resolver_pastas()
 
 AGROFIT_CSV_URL = (
     "https://dados.agricultura.gov.br/dataset/"
     "6c913699-e82e-4da3-a0a1-fb6c431e367f/resource/"
     "d30b30d7-e256-484e-9ab8-cd40974e1238/download/agrofitprodutosformulados.csv"
 )
-CSV_LOCAL = str(SCRIPT_DIR / "agrofitprodutosformulados.csv")
 SEP = ";"
 
 TOX_MAP = {
@@ -392,16 +471,21 @@ def carregar_dados_agrofit(forcar_download: bool = False) -> Optional[pd.DataFra
         print(f"  Última atualização: {dt_modif.strftime('%d/%m/%Y %H:%M:%S')}")
         print(f"  Idade: {segundos_para_tempo_legivel(idade)}")
         print(f"  Tamanho: {tamanho / (1024 * 1024):.1f} MB")
-        print("\nDeseja baixar a versão mais recente? (s/n)")
-        while True:
-            resp = input("> ").strip().lower()
-            if resp in ["s", "sim", "y", "yes"]:
-                deve_baixar = True
-                break
-            if resp in ["n", "nao", "não", "no"]:
-                deve_baixar = False
-                break
-            print_warning("Digite 's' ou 'n'.")
+        if NO_INPUT:
+            # No Colab / modo não-interativo: reutiliza o arquivo local
+            deve_baixar = False
+            print_success("Modo não-interativo: reutilizando arquivo local.")
+        else:
+            print("\nDeseja baixar a versão mais recente? (s/n)")
+            while True:
+                resp = input("> ").strip().lower()
+                if resp in ["s", "sim", "y", "yes"]:
+                    deve_baixar = True
+                    break
+                if resp in ["n", "nao", "não", "no"]:
+                    deve_baixar = False
+                    break
+                print_warning("Digite 's' ou 'n'.")
 
     if deve_baixar:
         print("\nIniciando download da base Agrofit...")
@@ -1143,14 +1227,24 @@ def gerar_produtos_com_ia(df: pd.DataFrame, ia: str, incluir_vendas: bool = Fals
 
 
 def main():
-    print_header("AGROFIT — ANÁLISES REGULATÓRIAS")
-    print("Script standalone para Windows / Linux / macOS")
-    print(f"Pasta de trabalho: {SCRIPT_DIR}\n")
+    # Re-resolve pastas no início (pega env vars definidas no notebook logo antes do %run)
+    global SCRIPT_DIR, DADOS_DIR, SAIDA_DIR, LOGS_DIR, NO_INPUT, CSV_LOCAL
+    SCRIPT_DIR, DADOS_DIR, SAIDA_DIR, LOGS_DIR, NO_INPUT, CSV_LOCAL = _resolver_pastas()
+
+    print_header("AGROFIT — PRODUTOS ALTERNATIVOS")
+    print("Script standalone para Windows / Linux / macOS / Google Colab")
+    print(f"Pasta do script: {SCRIPT_DIR}")
+    print(f"Pasta de dados : {DADOS_DIR}")
+    print(f"Pasta de saída : {SAIDA_DIR}")
+    print(f"CSV Agrofit    : {CSV_LOCAL}")
+    print(f"Modo Colab     : {_detectar_colab()}")
+    print(f"NO_INPUT       : {NO_INPUT}\n")
 
     df = carregar_dados_agrofit()
     if df is None:
         print_error("Não foi possível carregar a base Agrofit. Encerrando.")
-        input("Pressione Enter para sair...")
+        if not NO_INPUT:
+            input("Pressione Enter para sair...")
         return
 
     while True:
@@ -1166,13 +1260,13 @@ def main():
 
         if modo in ["sair", "s", "exit", "q", ""]:
             print_header("ENCERRADO")
-            print("Arquivos gerados estão na pasta do script.")
+            print(f"Arquivos gerados estão em: {SAIDA_DIR}")
             print("Agro é tech, agro é pop, agro é tudo! 🌱🚜")
             break
 
         # ---------- MODO 1 ----------
         if modo == "1":
-            pasta_saida = str(SCRIPT_DIR / "Resumos_Por_Cultura")
+            pasta_saida = str(SAIDA_DIR / "Resumos_Por_Cultura")
             Path(pasta_saida).mkdir(exist_ok=True)
             print_header("MODO 1 - BUSCA POR CULTURA")
             while True:
@@ -1192,7 +1286,7 @@ def main():
 
         # ---------- MODO 2 ----------
         elif modo == "2":
-            pasta_saida = str(SCRIPT_DIR / "Resumos_Por_Praga")
+            pasta_saida = str(SAIDA_DIR / "Resumos_Por_Praga")
             Path(pasta_saida).mkdir(exist_ok=True)
             print_header("MODO 2 - BUSCA POR PRAGA")
             while True:
@@ -1212,7 +1306,7 @@ def main():
 
         # ---------- MODO 3 ----------
         elif modo == "3":
-            pasta_base_raiz = str(SCRIPT_DIR / "Produtos_alternativos_por_IA")
+            pasta_base_raiz = str(SAIDA_DIR / "Produtos_alternativos_por_IA")
             Path(pasta_base_raiz).mkdir(exist_ok=True)
             print_header("MODO 3 - IA + ALTERNATIVOS")
             while True:
@@ -1340,7 +1434,7 @@ def main():
 
         # ---------- MODO 4 ----------
         elif modo == "4":
-            pasta_base_raiz = str(SCRIPT_DIR / "Produtos_Com_IA_para_Dose")
+            pasta_base_raiz = str(SAIDA_DIR / "Produtos_Com_IA_para_Dose")
             Path(pasta_base_raiz).mkdir(exist_ok=True)
             print_header("MODO 4 - PRODUTOS COM IA (dose)")
             while True:
