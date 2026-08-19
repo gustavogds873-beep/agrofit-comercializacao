@@ -1128,6 +1128,184 @@ def _metricas_comercializacao(df_prod: pd.DataFrame) -> Tuple[Any, Any]:
     return n_com, round(vol, 4)
 
 
+# ================================================================
+# IRAC / MoA — tabela de referência (CSV opcional)
+# ================================================================
+
+def _norm_ia_nome(nome: str) -> str:
+    """Normaliza nome de IA para matching com a tabela IRAC."""
+    if nome is None or (isinstance(nome, float) and pd.isna(nome)):
+        return ""
+    s = str(nome).strip().lower()
+    if UNIDECODE_AVAILABLE:
+        s = unidecode(s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = s.replace(",", " ").replace(";", " ").replace("/", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    for pref in (
+        "benzoato de ", "hidrocloreto de ", "sulfato de ", "acetato de ",
+        "oxido de ", "óxido de ",
+    ):
+        if s.startswith(pref):
+            s = s[len(pref):].strip()
+    return s
+
+
+def carregar_tabela_irac(
+    caminhos: Optional[List[Union[str, Path]]] = None,
+    pasta_busca: Optional[Union[str, Path]] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Carrega CSV/Excel de referência IRAC (IA → grupo MoA).
+
+    Formato esperado (separador ; ou ,):
+      IA_normalizado;Grupo_IRAC;Nome_Grupo_Principal;Subgrupo_ou_Classe;Comite;Fonte
+    """
+    arquivos: List[Path] = []
+    if caminhos:
+        for c in caminhos:
+            p = Path(c)
+            if p.is_file():
+                arquivos.append(p)
+    if not arquivos:
+        bases = []
+        if pasta_busca:
+            bases.append(Path(pasta_busca))
+        bases.extend([DADOS_DIR, SCRIPT_DIR, Path.cwd()])
+        if Path("/content/dados").is_dir():
+            bases.append(Path("/content/dados"))
+        if Path("/content/scripts").is_dir():
+            bases.append(Path("/content/scripts"))
+        padroes = [
+            "irac_moa_referencia.csv", "irac*.csv", "*irac*moa*.csv",
+            "*IRAC*.csv", "*irac*.xlsx", "moa_referencia.csv",
+        ]
+        for base in bases:
+            for pad in padroes:
+                arquivos.extend(base.glob(pad))
+        arquivos = sorted({a.resolve() for a in arquivos if a.is_file()})
+
+    if not arquivos:
+        return None
+
+    print_header("IRAC / MoA (referência)")
+    dfs = []
+    for arq in arquivos:
+        print(f"→ Lendo: {arq.name}")
+        try:
+            if arq.suffix.lower() in {".xlsx", ".xls"}:
+                df_t = pd.read_excel(arq, dtype=str)
+            else:
+                try:
+                    df_t = pd.read_csv(arq, sep=";", dtype=str)
+                    if len(df_t.columns) <= 1:
+                        df_t = pd.read_csv(arq, sep=",", dtype=str)
+                except Exception:
+                    df_t = pd.read_csv(arq, sep=",", dtype=str)
+        except Exception as e:
+            print_error(f"Erro ao ler {arq.name}: {e}")
+            continue
+
+        col_map = {_norm_col_nome(c): c for c in df_t.columns}
+        col_ia = None
+        for k in ("ia_normalizado", "ia", "ingrediente ativo", "active ingredient", "nome"):
+            if k in col_map:
+                col_ia = col_map[k]
+                break
+        if col_ia is None:
+            col_ia = df_t.columns[0]
+
+        col_grupo = None
+        for k in ("grupo_irac", "grupo irac", "grupo_moa", "grupo moa", "moa", "group"):
+            if k in col_map:
+                col_grupo = col_map[k]
+                break
+        col_nome_g = None
+        for k in ("nome_grupo_principal", "nome grupo principal", "nome_grupo", "group name"):
+            if k in col_map:
+                col_nome_g = col_map[k]
+                break
+        col_sub = None
+        for k in ("subgrupo_ou_classe", "subgrupo ou classe", "subgrupo", "classe", "subgroup"):
+            if k in col_map:
+                col_sub = col_map[k]
+                break
+        col_comite = col_map.get("comite") or col_map.get("committee")
+        col_fonte = col_map.get("fonte") or col_map.get("source")
+
+        sub = pd.DataFrame()
+        sub["IA_normalizado"] = df_t[col_ia].astype(str).map(_norm_ia_nome)
+        sub["Grupo_IRAC"] = df_t[col_grupo].astype(str).str.strip() if col_grupo else "Não informado"
+        sub["Nome_Grupo_Principal"] = (
+            df_t[col_nome_g].astype(str).str.strip() if col_nome_g else ""
+        )
+        sub["Subgrupo_ou_Classe"] = (
+            df_t[col_sub].astype(str).str.strip() if col_sub else ""
+        )
+        sub["Comite"] = df_t[col_comite].astype(str).str.strip() if col_comite else "IRAC"
+        sub["Fonte"] = df_t[col_fonte].astype(str).str.strip() if col_fonte else ""
+        sub = sub[sub["IA_normalizado"] != ""].drop_duplicates(subset=["IA_normalizado"])
+        dfs.append(sub)
+        print_success(f"  {len(sub):,} IAs na referência")
+
+    if not dfs:
+        return None
+
+    df_irac = pd.concat(dfs, ignore_index=True)
+    df_irac = df_irac.drop_duplicates(subset=["IA_normalizado"], keep="first")
+    print_success(f"IRAC consolidado: {len(df_irac):,} ingredientes ativos")
+    return df_irac
+
+
+def _lookup_irac(ia_nome: str, df_irac: Optional[pd.DataFrame]) -> Dict[str, str]:
+    """Retorna dict com campos IRAC para um IA."""
+    vazio = {
+        "Grupo_IRAC": "Não informado",
+        "Nome_Grupo_Principal": "",
+        "Subgrupo_ou_Classe": "",
+        "Comite": "",
+    }
+    if df_irac is None or df_irac.empty or not ia_nome:
+        return vazio
+    key = _norm_ia_nome(ia_nome)
+    if not key:
+        return vazio
+    hit = df_irac[df_irac["IA_normalizado"] == key]
+    if hit.empty:
+        # tenta match se a chave contém o nome da tabela ou vice-versa
+        for _, row in df_irac.iterrows():
+            ref = str(row["IA_normalizado"])
+            if ref and (ref == key or ref in key or key in ref):
+                return {
+                    "Grupo_IRAC": str(row.get("Grupo_IRAC", "Não informado")),
+                    "Nome_Grupo_Principal": str(row.get("Nome_Grupo_Principal", "") or ""),
+                    "Subgrupo_ou_Classe": str(row.get("Subgrupo_ou_Classe", "") or ""),
+                    "Comite": str(row.get("Comite", "IRAC") or "IRAC"),
+                }
+        return vazio
+    row = hit.iloc[0]
+    return {
+        "Grupo_IRAC": str(row.get("Grupo_IRAC", "Não informado")),
+        "Nome_Grupo_Principal": str(row.get("Nome_Grupo_Principal", "") or ""),
+        "Subgrupo_ou_Classe": str(row.get("Subgrupo_ou_Classe", "") or ""),
+        "Comite": str(row.get("Comite", "IRAC") or "IRAC"),
+    }
+
+
+def _metricas_irac(grupos: List[str]) -> Any:
+    """Conta grupos IRAC distintos (ignora vazio / Não informado)."""
+    limpos = {
+        str(g).strip()
+        for g in grupos
+        if g
+        and str(g).strip()
+        and str(g).strip().lower() not in ("não informado", "nao informado", "nan", "")
+    }
+    if not limpos:
+        return "Não analisado"
+    return len(limpos)
+
+
 def gerar_produtos_alternativos_por_praga(
     df: pd.DataFrame,
     ias_list: list,
@@ -1136,6 +1314,7 @@ def gerar_produtos_alternativos_por_praga(
     ia_principal: Optional[str] = None,
     incluir_analise: bool = False,
     df_vendas: Optional[pd.DataFrame] = None,
+    df_irac: Optional[pd.DataFrame] = None,
 ):
     """
     Gera arquivos Excel organizados por PRAGA (uma praga por arquivo).
@@ -1218,6 +1397,25 @@ def gerar_produtos_alternativos_por_praga(
             df_alt_com_venda = _anexar_comercializacao(df_alt_unique, df_vendas)
             n_comerc, vol_comerc = _metricas_comercializacao(df_alt_com_venda)
 
+            # IRAC por IA desta combinação
+            grupos_irac_comb: List[str] = []
+            for ia_alt, grupo in df_alt_unique.groupby("INGREDIENTE_ATIVO", sort=False):
+                classe_uso = "Não informado"
+                if "CLASSE" in grupo.columns:
+                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                irac = _lookup_irac(str(ia_alt), df_irac)
+                grupos_irac_comb.append(irac["Grupo_IRAC"])
+                resumo_ia_rows.append({
+                    "Cultura": cultura,
+                    "Praga": praga,
+                    "IA": ia_alt,
+                    "Classe de USO": classe_uso,
+                    "Grupo IRAC": irac["Grupo_IRAC"],
+                    "Nome Grupo IRAC": irac["Nome_Grupo_Principal"],
+                    "Subgrupo/Classe IRAC": irac["Subgrupo_ou_Classe"],
+                    "Comite MoA": irac["Comite"],
+                })
+
             # --- Relatorio (uma linha por Cultura + Praga) ---
             relatorio_rows.append({
                 "Cultura": cultura,
@@ -1226,22 +1424,8 @@ def gerar_produtos_alternativos_por_praga(
                 "quantitativo de IA diferentes": n_ias,
                 "Produtos comercializados": n_comerc,
                 "Volume comercializado (PF)": vol_comerc,
-                "nº grupos IRAC": "Não analisado",
+                "nº grupos IRAC": _metricas_irac(grupos_irac_comb),
             })
-
-            # --- Resumo_IA (uma linha por Cultura + Praga + IA) ---
-            # Agrupa por IA e obtém classe de uso modal
-            for ia_alt, grupo in df_alt_unique.groupby("INGREDIENTE_ATIVO", sort=False):
-                classe_uso = "Não informado"
-                if "CLASSE" in grupo.columns:
-                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
-                resumo_ia_rows.append({
-                    "Cultura": cultura,
-                    "Praga": praga,
-                    "IA": ia_alt,
-                    "Classe de USO": classe_uso,
-                    "Grupo IRAC": "Não informado",
-                })
 
             # Guarda produtos para a aba de detalhamento
             lista_produtos.append(df_alt_unique)
@@ -1282,30 +1466,7 @@ def gerar_produtos_alternativos_por_praga(
             n_ias_geral = 0
         n_comerc_geral, vol_comerc_geral = _metricas_comercializacao(df_produtos)
 
-        # Linha GERAL no topo do Relatorio
-        linha_geral = {
-            "Cultura": "GERAL (todas as culturas)",
-            "Praga": praga,
-            "nº de produtos alternativos": n_produtos_geral,
-            "quantitativo de IA diferentes": n_ias_geral,
-            "Produtos comercializados": n_comerc_geral,
-            "Volume comercializado (PF)": vol_comerc_geral,
-            "nº grupos IRAC": "Não analisado",
-        }
-
-        # Monta DataFrames finais
-        df_relatorio = (
-            pd.DataFrame(relatorio_rows)
-            .drop_duplicates(subset=["Cultura", "Praga"])
-            .sort_values("Cultura")
-            .reset_index(drop=True)
-        )
-        # Insere a linha GERAL como primeira linha
-        df_relatorio = pd.concat(
-            [pd.DataFrame([linha_geral]), df_relatorio],
-            ignore_index=True,
-        )
-
+        # Resumo_IA por combinação já montado; visão GERAL por IA da praga
         df_resumo_ia = (
             pd.DataFrame(resumo_ia_rows)
             .drop_duplicates(subset=["Cultura", "Praga", "IA"])
@@ -1313,19 +1474,24 @@ def gerar_produtos_alternativos_por_praga(
             .reset_index(drop=True)
         )
 
-        # Resumo_IA também ganha visão GERAL: uma linha por IA distinto da praga
         resumo_ia_geral_rows: List[Dict[str, Any]] = []
+        grupos_irac_geral: List[str] = []
         if not df_produtos.empty and "INGREDIENTE_ATIVO" in df_produtos.columns:
             for ia_alt, grupo in df_produtos.groupby("INGREDIENTE_ATIVO", sort=False):
                 classe_uso = "Não informado"
                 if "CLASSE" in grupo.columns:
                     classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                irac = _lookup_irac(str(ia_alt), df_irac)
+                grupos_irac_geral.append(irac["Grupo_IRAC"])
                 resumo_ia_geral_rows.append({
                     "Cultura": "GERAL (todas as culturas)",
                     "Praga": praga,
                     "IA": ia_alt,
                     "Classe de USO": classe_uso,
-                    "Grupo IRAC": "Não informado",
+                    "Grupo IRAC": irac["Grupo_IRAC"],
+                    "Nome Grupo IRAC": irac["Nome_Grupo_Principal"],
+                    "Subgrupo/Classe IRAC": irac["Subgrupo_ou_Classe"],
+                    "Comite MoA": irac["Comite"],
                 })
             if resumo_ia_geral_rows:
                 df_resumo_ia = pd.concat(
@@ -1337,6 +1503,29 @@ def gerar_produtos_alternativos_por_praga(
                     ],
                     ignore_index=True,
                 )
+        n_grupos_irac_geral = _metricas_irac(grupos_irac_geral)
+
+        # Linha GERAL no topo do Relatorio
+        linha_geral = {
+            "Cultura": "GERAL (todas as culturas)",
+            "Praga": praga,
+            "nº de produtos alternativos": n_produtos_geral,
+            "quantitativo de IA diferentes": n_ias_geral,
+            "Produtos comercializados": n_comerc_geral,
+            "Volume comercializado (PF)": vol_comerc_geral,
+            "nº grupos IRAC": n_grupos_irac_geral,
+        }
+
+        df_relatorio = (
+            pd.DataFrame(relatorio_rows)
+            .drop_duplicates(subset=["Cultura", "Praga"])
+            .sort_values("Cultura")
+            .reset_index(drop=True)
+        )
+        df_relatorio = pd.concat(
+            [pd.DataFrame([linha_geral]), df_relatorio],
+            ignore_index=True,
+        )
 
         # Aba dedicada ao resumo geral da praga (visão rápida)
         obs_comerc = ""
@@ -1345,6 +1534,9 @@ def gerar_produtos_alternativos_por_praga(
                 f" Destes, {n_comerc_geral} produto(s) constam como comercializados "
                 f"(volume PF total: {vol_comerc_geral})."
             )
+        obs_irac = ""
+        if n_grupos_irac_geral != "Não analisado":
+            obs_irac = f" Cobrem {n_grupos_irac_geral} grupo(s) IRAC/MoA distinto(s)."
         df_resumo_geral_praga = pd.DataFrame([{
             "Praga": praga,
             "Nº de culturas com alternativos": n_culturas,
@@ -1352,12 +1544,12 @@ def gerar_produtos_alternativos_por_praga(
             "Nº de ingredientes ativos diferentes": n_ias_geral,
             "Produtos comercializados": n_comerc_geral,
             "Volume comercializado (PF)": vol_comerc_geral,
-            "Nº grupos IRAC": "Não analisado",
+            "Nº grupos IRAC": n_grupos_irac_geral,
             "Observação": (
                 f"Para a praga {praga}, independente da cultura, "
                 f"existem {n_produtos_geral} produto(s) alternativo(s) "
                 f"com {n_ias_geral} ingrediente(s) ativo(s) diferente(s), "
-                f"distribuídos em {n_culturas} cultura(s).{obs_comerc}"
+                f"distribuídos em {n_culturas} cultura(s).{obs_comerc}{obs_irac}"
             ),
         }])
 
@@ -1418,6 +1610,7 @@ def gerar_produtos_alternativos_por_cultura(
     ia_principal: Optional[str] = None,
     incluir_analise: bool = False,
     df_vendas: Optional[pd.DataFrame] = None,
+    df_irac: Optional[pd.DataFrame] = None,
 ):
     """
     Gera arquivos Excel organizados por CULTURA (mesma estrutura da análise por praga).
@@ -1486,6 +1679,24 @@ def gerar_produtos_alternativos_por_cultura(
             df_alt_com_venda = _anexar_comercializacao(df_alt_unique, df_vendas)
             n_comerc, vol_comerc = _metricas_comercializacao(df_alt_com_venda)
 
+            grupos_irac_comb: List[str] = []
+            for ia_alt, grupo in df_alt_unique.groupby("INGREDIENTE_ATIVO", sort=False):
+                classe_uso = "Não informado"
+                if "CLASSE" in grupo.columns:
+                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                irac = _lookup_irac(str(ia_alt), df_irac)
+                grupos_irac_comb.append(irac["Grupo_IRAC"])
+                resumo_ia_rows.append({
+                    "Cultura": cultura,
+                    "Praga": praga,
+                    "IA": ia_alt,
+                    "Classe de USO": classe_uso,
+                    "Grupo IRAC": irac["Grupo_IRAC"],
+                    "Nome Grupo IRAC": irac["Nome_Grupo_Principal"],
+                    "Subgrupo/Classe IRAC": irac["Subgrupo_ou_Classe"],
+                    "Comite MoA": irac["Comite"],
+                })
+
             relatorio_rows.append({
                 "Cultura": cultura,
                 "Praga": praga,
@@ -1493,20 +1704,8 @@ def gerar_produtos_alternativos_por_cultura(
                 "quantitativo de IA diferentes": n_ias,
                 "Produtos comercializados": n_comerc,
                 "Volume comercializado (PF)": vol_comerc,
-                "nº grupos IRAC": "Não analisado",
+                "nº grupos IRAC": _metricas_irac(grupos_irac_comb),
             })
-
-            for ia_alt, grupo in df_alt_unique.groupby("INGREDIENTE_ATIVO", sort=False):
-                classe_uso = "Não informado"
-                if "CLASSE" in grupo.columns:
-                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
-                resumo_ia_rows.append({
-                    "Cultura": cultura,
-                    "Praga": praga,
-                    "IA": ia_alt,
-                    "Classe de USO": classe_uso,
-                    "Grupo IRAC": "Não informado",
-                })
 
             lista_produtos.append(df_alt_unique)
 
@@ -1544,6 +1743,44 @@ def gerar_produtos_alternativos_por_cultura(
             n_ias_geral = 0
         n_comerc_geral, vol_comerc_geral = _metricas_comercializacao(df_produtos)
 
+        df_resumo_ia = (
+            pd.DataFrame(resumo_ia_rows)
+            .drop_duplicates(subset=["Cultura", "Praga", "IA"])
+            .sort_values(["Praga", "IA"])
+            .reset_index(drop=True)
+        )
+
+        resumo_ia_geral_rows: List[Dict[str, Any]] = []
+        grupos_irac_geral: List[str] = []
+        if not df_produtos.empty and "INGREDIENTE_ATIVO" in df_produtos.columns:
+            for ia_alt, grupo in df_produtos.groupby("INGREDIENTE_ATIVO", sort=False):
+                classe_uso = "Não informado"
+                if "CLASSE" in grupo.columns:
+                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                irac = _lookup_irac(str(ia_alt), df_irac)
+                grupos_irac_geral.append(irac["Grupo_IRAC"])
+                resumo_ia_geral_rows.append({
+                    "Cultura": cultura,
+                    "Praga": "GERAL (todas as pragas)",
+                    "IA": ia_alt,
+                    "Classe de USO": classe_uso,
+                    "Grupo IRAC": irac["Grupo_IRAC"],
+                    "Nome Grupo IRAC": irac["Nome_Grupo_Principal"],
+                    "Subgrupo/Classe IRAC": irac["Subgrupo_ou_Classe"],
+                    "Comite MoA": irac["Comite"],
+                })
+            if resumo_ia_geral_rows:
+                df_resumo_ia = pd.concat(
+                    [
+                        pd.DataFrame(resumo_ia_geral_rows).drop_duplicates(
+                            subset=["Cultura", "Praga", "IA"]
+                        ),
+                        df_resumo_ia,
+                    ],
+                    ignore_index=True,
+                )
+        n_grupos_irac_geral = _metricas_irac(grupos_irac_geral)
+
         linha_geral = {
             "Cultura": cultura,
             "Praga": "GERAL (todas as pragas)",
@@ -1551,7 +1788,7 @@ def gerar_produtos_alternativos_por_cultura(
             "quantitativo de IA diferentes": n_ias_geral,
             "Produtos comercializados": n_comerc_geral,
             "Volume comercializado (PF)": vol_comerc_geral,
-            "nº grupos IRAC": "Não analisado",
+            "nº grupos IRAC": n_grupos_irac_geral,
         }
 
         df_relatorio = (
@@ -1565,44 +1802,15 @@ def gerar_produtos_alternativos_por_cultura(
             ignore_index=True,
         )
 
-        df_resumo_ia = (
-            pd.DataFrame(resumo_ia_rows)
-            .drop_duplicates(subset=["Cultura", "Praga", "IA"])
-            .sort_values(["Praga", "IA"])
-            .reset_index(drop=True)
-        )
-
-        # Bloco GERAL de IAs da cultura
-        resumo_ia_geral_rows: List[Dict[str, Any]] = []
-        if not df_produtos.empty and "INGREDIENTE_ATIVO" in df_produtos.columns:
-            for ia_alt, grupo in df_produtos.groupby("INGREDIENTE_ATIVO", sort=False):
-                classe_uso = "Não informado"
-                if "CLASSE" in grupo.columns:
-                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
-                resumo_ia_geral_rows.append({
-                    "Cultura": cultura,
-                    "Praga": "GERAL (todas as pragas)",
-                    "IA": ia_alt,
-                    "Classe de USO": classe_uso,
-                    "Grupo IRAC": "Não informado",
-                })
-            if resumo_ia_geral_rows:
-                df_resumo_ia = pd.concat(
-                    [
-                        pd.DataFrame(resumo_ia_geral_rows).drop_duplicates(
-                            subset=["Cultura", "Praga", "IA"]
-                        ),
-                        df_resumo_ia,
-                    ],
-                    ignore_index=True,
-                )
-
         obs_comerc = ""
         if n_comerc_geral != "Não analisado":
             obs_comerc = (
                 f" Destes, {n_comerc_geral} produto(s) constam como comercializados "
                 f"(volume PF total: {vol_comerc_geral})."
             )
+        obs_irac = ""
+        if n_grupos_irac_geral != "Não analisado":
+            obs_irac = f" Cobrem {n_grupos_irac_geral} grupo(s) IRAC/MoA distinto(s)."
         df_resumo_geral = pd.DataFrame([{
             "Cultura": cultura,
             "Nº de pragas com alternativos": n_pragas,
@@ -1610,12 +1818,12 @@ def gerar_produtos_alternativos_por_cultura(
             "Nº de ingredientes ativos diferentes": n_ias_geral,
             "Produtos comercializados": n_comerc_geral,
             "Volume comercializado (PF)": vol_comerc_geral,
-            "Nº grupos IRAC": "Não analisado",
+            "Nº grupos IRAC": n_grupos_irac_geral,
             "Observação": (
                 f"Para a cultura {cultura}, "
                 f"existem {n_produtos_geral} produto(s) alternativo(s) "
                 f"com {n_ias_geral} ingrediente(s) ativo(s) diferente(s), "
-                f"cobrindo {n_pragas} praga(s).{obs_comerc}"
+                f"cobrindo {n_pragas} praga(s).{obs_comerc}{obs_irac}"
             ),
         }])
 
@@ -1911,6 +2119,21 @@ def main():
                         f"Comercialização ativa: {len(df_vendas_mod3):,} produtos na base de vendas."
                     )
 
+            # IRAC / MoA — busca automática em dados/scripts (CSV de referência)
+            df_irac_mod3 = carregar_tabela_irac(pasta_busca=DADOS_DIR)
+            if df_irac_mod3 is None:
+                # tenta também na pasta do script / Colab scripts
+                df_irac_mod3 = carregar_tabela_irac(pasta_busca=SCRIPT_DIR)
+            if df_irac_mod3 is None:
+                print_warning(
+                    "Tabela IRAC (irac_moa_referencia.csv) não encontrada. "
+                    "Coluna Grupo IRAC permanecerá como 'Não informado'."
+                )
+            else:
+                print_success(
+                    f"IRAC ativo: {len(df_irac_mod3):,} ingredientes na referência MoA."
+                )
+
             while True:
                 ia = input(f"{bcolors.OKBLUE}Ingrediente Ativo (ou 'voltar'): {bcolors.ENDC}").strip()
                 if ia.lower() in ["voltar", "v", ""]:
@@ -1970,39 +2193,39 @@ def main():
                     if escolha in ["0", "todas", "t", "all"]:
                         gerar_produtos_alternativos_por_cultura(
                             df, ias_selecionados, df_combs, pasta_cult_com,
-                            ia, True, df_vendas_mod3,
+                            ia, True, df_vendas_mod3, df_irac_mod3,
                         )
                         gerar_produtos_alternativos_por_cultura(
                             df, ias_selecionados, df_combs, pasta_cult_sem,
-                            ia, False, df_vendas_mod3,
+                            ia, False, df_vendas_mod3, df_irac_mod3,
                         )
                         gerar_produtos_alternativos_por_praga(
                             df, ias_selecionados, df_combs, pasta_praga_com,
-                            ia, True, df_vendas_mod3,
+                            ia, True, df_vendas_mod3, df_irac_mod3,
                         )
                         gerar_produtos_alternativos_por_praga(
                             df, ias_selecionados, df_combs, pasta_praga_sem,
-                            ia, False, df_vendas_mod3,
+                            ia, False, df_vendas_mod3, df_irac_mod3,
                         )
                         print_success("Geração concluída (Por Cultura + Por Praga)!")
                     elif escolha in ["cultura", "cu", "porcultura", "por_cultura"]:
                         gerar_produtos_alternativos_por_cultura(
                             df, ias_selecionados, df_combs, pasta_cult_com,
-                            ia, True, df_vendas_mod3,
+                            ia, True, df_vendas_mod3, df_irac_mod3,
                         )
                         gerar_produtos_alternativos_por_cultura(
                             df, ias_selecionados, df_combs, pasta_cult_sem,
-                            ia, False, df_vendas_mod3,
+                            ia, False, df_vendas_mod3, df_irac_mod3,
                         )
                         print_success("Geração por CULTURA concluída!")
                     elif escolha in ["praga", "pr", "porpraga", "por_praga"]:
                         gerar_produtos_alternativos_por_praga(
                             df, ias_selecionados, df_combs, pasta_praga_com,
-                            ia, True, df_vendas_mod3,
+                            ia, True, df_vendas_mod3, df_irac_mod3,
                         )
                         gerar_produtos_alternativos_por_praga(
                             df, ias_selecionados, df_combs, pasta_praga_sem,
-                            ia, False, df_vendas_mod3,
+                            ia, False, df_vendas_mod3, df_irac_mod3,
                         )
                         print_success("Geração por PRAGA concluída!")
                     elif escolha.startswith("c") and escolha not in ("cultura", "cu"):
