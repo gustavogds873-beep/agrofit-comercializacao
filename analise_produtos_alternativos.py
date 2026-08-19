@@ -905,6 +905,229 @@ def _deduplicar_produtos_alt(df_alt: pd.DataFrame) -> pd.DataFrame:
     return df_alt.drop_duplicates(keep="first")
 
 
+# ================================================================
+# COMERCIALIZAÇÃO OPCIONAL (Tabela Bruta / planilhas anuais)
+# ================================================================
+
+def _norm_col_nome(c: str) -> str:
+    """Normaliza nome de coluna (remove <br>, espaços extras, acentos básicos)."""
+    s = str(c).replace("<br>", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    if UNIDECODE_AVAILABLE:
+        s = unidecode(s)
+    return s
+
+
+def _to_float_safe(val) -> float:
+    if pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(".", "").replace(",", ".") if False else str(val).strip()
+    # Mantém ponto decimal padrão; vírgula como decimal se não houver ponto
+    if "," in s and "." not in s:
+        s = s.replace(",", ".")
+    s = re.sub(r"[^\d.\-]", "", s)
+    try:
+        return float(s) if s else 0.0
+    except ValueError:
+        return 0.0
+
+
+def carregar_tabela_comercializacao(
+    caminhos: Optional[List[Union[str, Path]]] = None,
+    pasta_busca: Optional[Union[str, Path]] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Carrega tabela(s) de comercialização no formato 'Tabela Bruta Comercialização_Agrotóxicos AAAA'.
+
+    Retorna DataFrame com uma linha por CHAVE_FLEXIVEL (registro MAPA normalizado):
+      CHAVE_FLEXIVEL, NR_REGISTRO_COMERC, Venda_Cliente, Venda_Industria,
+      Venda_Total_PF, Comercializado
+
+    Se nenhum arquivo for encontrado, retorna None (análise segue sem vendas).
+    """
+    arquivos: List[Path] = []
+    if caminhos:
+        for c in caminhos:
+            p = Path(c)
+            if p.is_file():
+                arquivos.append(p)
+    if not arquivos:
+        base = Path(pasta_busca) if pasta_busca else DADOS_DIR
+        padroes = [
+            "*Comercializa*.xlsx", "*Comercializa*.xls", "*Comercializa*.csv",
+            "*comercializa*.xlsx", "*comercializa*.csv",
+            "Tabela*Agrot*.xlsx", "Tabela*Agrot*.csv",
+        ]
+        for pad in padroes:
+            arquivos.extend(base.glob(pad))
+            arquivos.extend(Path.cwd().glob(pad))
+        # Colab
+        if Path("/content/dados").is_dir():
+            for pad in padroes:
+                arquivos.extend(Path("/content/dados").glob(pad))
+        arquivos = sorted({a.resolve() for a in arquivos if a.is_file()})
+
+    if not arquivos:
+        return None
+
+    print_header("COMERCIALIZAÇÃO (opcional)")
+    dfs = []
+    for arq in arquivos:
+        print(f"→ Lendo: {arq.name}")
+        try:
+            if arq.suffix.lower() in {".xlsx", ".xls"}:
+                xl = pd.ExcelFile(arq)
+                # Prefere aba com 'Relatorio' / 'TODOS' / primeira
+                sheet = xl.sheet_names[0]
+                for s in xl.sheet_names:
+                    sl = s.lower()
+                    if "relatorio" in sl or "todos" in sl or "agrotox" in sl:
+                        sheet = s
+                        break
+                df_t = pd.read_excel(arq, sheet_name=sheet, dtype=str)
+            else:
+                try:
+                    df_t = pd.read_csv(arq, sep=";", dtype=str)
+                    if len(df_t.columns) <= 1:
+                        df_t = pd.read_csv(arq, sep=",", dtype=str)
+                except Exception:
+                    df_t = pd.read_csv(arq, sep=",", dtype=str)
+        except Exception as e:
+            print_error(f"Erro ao ler {arq.name}: {e}")
+            continue
+
+        # Mapeia colunas pelo nome normalizado
+        col_map = {_norm_col_nome(c): c for c in df_t.columns}
+        col_reg = None
+        for key in ("registro mapa", "registro_mapa", "nr registro", "n registro", "registro"):
+            if key in col_map:
+                col_reg = col_map[key]
+                break
+        if col_reg is None:
+            for nk, orig in col_map.items():
+                if "registro" in nk and "mapa" in nk:
+                    col_reg = orig
+                    break
+        if col_reg is None:
+            print_warning(f"Coluna de registro MAPA não encontrada em {arq.name}")
+            continue
+
+        col_cli = col_map.get("vendas a cliente") or col_map.get("venda a cliente")
+        col_ind = col_map.get("vendas a industria") or col_map.get("venda a industria")
+        # Evita colunas ponderadas (*6, *7) preferindo as sem sufixo numérico
+        if col_cli is None:
+            for nk, orig in col_map.items():
+                if "vendas a cliente" in nk and not re.search(r"\d$", nk.replace(" ", "")):
+                    col_cli = orig
+                    break
+        if col_ind is None:
+            for nk, orig in col_map.items():
+                if "vendas a industria" in nk and not re.search(r"\d$", nk.replace(" ", "")):
+                    col_ind = orig
+                    break
+
+        sub = pd.DataFrame()
+        sub["NR_REGISTRO_COMERC"] = df_t[col_reg].astype(str).str.strip()
+        sub["CHAVE_FLEXIVEL"] = sub["NR_REGISTRO_COMERC"].apply(extrair_chave_flexivel)
+        sub["Venda_Cliente"] = df_t[col_cli].apply(_to_float_safe) if col_cli else 0.0
+        sub["Venda_Industria"] = df_t[col_ind].apply(_to_float_safe) if col_ind else 0.0
+        sub["Venda_Total_PF"] = sub["Venda_Cliente"] + sub["Venda_Industria"]
+        # Remove linhas sem chave
+        sub = sub[sub["CHAVE_FLEXIVEL"] != ""].copy()
+        # Mesmo registro pode repetir por IA: agrega max (volumes PF se repetem)
+        sub = (
+            sub.groupby("CHAVE_FLEXIVEL", as_index=False)
+            .agg({
+                "NR_REGISTRO_COMERC": "first",
+                "Venda_Cliente": "max",
+                "Venda_Industria": "max",
+                "Venda_Total_PF": "max",
+            })
+        )
+        dfs.append(sub)
+        print_success(f"  {len(sub):,} registros únicos de comercialização")
+
+    if not dfs:
+        return None
+
+    df_v = pd.concat(dfs, ignore_index=True)
+    # Se vários anos, soma volumes
+    df_v = (
+        df_v.groupby("CHAVE_FLEXIVEL", as_index=False)
+        .agg({
+            "NR_REGISTRO_COMERC": "first",
+            "Venda_Cliente": "sum",
+            "Venda_Industria": "sum",
+            "Venda_Total_PF": "sum",
+        })
+    )
+    df_v["Comercializado"] = df_v["Venda_Total_PF"].apply(
+        lambda x: "Sim" if x and float(x) > 0 else "Não"
+    )
+    print_success(f"Comercialização consolidada: {len(df_v):,} produtos")
+    return df_v
+
+
+def _anexar_comercializacao(
+    df_produtos: pd.DataFrame,
+    df_vendas: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Anexa colunas de comercialização aos produtos alternativos (por NR_REGISTRO)."""
+    if df_produtos is None or df_produtos.empty:
+        return df_produtos
+
+    cols_venda = ["Venda_Cliente", "Venda_Industria", "Venda_Total_PF", "Comercializado"]
+
+    if df_vendas is None or df_vendas.empty:
+        for c in cols_venda:
+            if c == "Comercializado":
+                df_produtos[c] = "Não analisado"
+            else:
+                df_produtos[c] = None
+        return df_produtos
+
+    df_out = df_produtos.copy()
+    if "NR_REGISTRO" in df_out.columns:
+        df_out["_CHAVE"] = df_out["NR_REGISTRO"].apply(extrair_chave_flexivel)
+    else:
+        df_out["_CHAVE"] = ""
+
+    df_out = df_out.merge(
+        df_vendas.rename(columns={"CHAVE_FLEXIVEL": "_CHAVE"}),
+        on="_CHAVE",
+        how="left",
+        suffixes=("", "_comerc"),
+    )
+    df_out.drop(columns=["_CHAVE", "NR_REGISTRO_COMERC"], inplace=True, errors="ignore")
+
+    for c in ("Venda_Cliente", "Venda_Industria", "Venda_Total_PF"):
+        if c not in df_out.columns:
+            df_out[c] = 0.0
+        else:
+            df_out[c] = df_out[c].fillna(0.0)
+    if "Comercializado" not in df_out.columns:
+        df_out["Comercializado"] = "Não"
+    else:
+        df_out["Comercializado"] = df_out["Comercializado"].fillna("Não")
+        # Registros sem match ficam "Não" (constam na base de vendas com 0) ou
+        # se não estavam na tabela: já fillna Não
+    return df_out
+
+
+def _metricas_comercializacao(df_prod: pd.DataFrame) -> Tuple[Any, Any]:
+    """Retorna (n_produtos_comercializados, volume_total) a partir de df com colunas de venda."""
+    if df_prod is None or df_prod.empty or "Comercializado" not in df_prod.columns:
+        return "Não analisado", "Não analisado"
+    # Se todos "Não analisado"
+    if df_prod["Comercializado"].astype(str).str.lower().eq("não analisado").all():
+        return "Não analisado", "Não analisado"
+    n_com = int((df_prod["Comercializado"].astype(str).str.lower() == "sim").sum())
+    vol = float(df_prod["Venda_Total_PF"].fillna(0).sum()) if "Venda_Total_PF" in df_prod.columns else 0.0
+    return n_com, round(vol, 4)
+
+
 def gerar_produtos_alternativos_por_praga(
     df: pd.DataFrame,
     ias_list: list,
@@ -912,14 +1135,19 @@ def gerar_produtos_alternativos_por_praga(
     pasta_base: str,
     ia_principal: Optional[str] = None,
     incluir_analise: bool = False,
+    df_vendas: Optional[pd.DataFrame] = None,
 ):
     """
     Gera arquivos Excel organizados por PRAGA (uma praga por arquivo).
 
     Cada arquivo contém:
+      - Resumo_Geral_Praga : visão consolidada da praga (todas as culturas)
+                             nº produtos únicos, nº IAs distintos, nº culturas
       - Resumo_IA          : Cultura | Praga | IA | Classe de USO | Grupo IRAC
+                             (inclui bloco GERAL com IAs únicos da praga)
       - Relatorio          : Cultura | Praga | nº produtos alt. | nº IAs distintos |
                              Produtos comercializados | nº grupos IRAC
+                             (1ª linha = GERAL com totais independentes da cultura)
       - Produtos_Alternativos : detalhamento dos produtos (auditoria)
 
     Colunas de comercialização e IRAC ficam preparadas para futuras integrações
@@ -986,13 +1214,18 @@ def gerar_produtos_alternativos_por_praga(
             n_produtos = len(df_alt_unique)
             n_ias = df_alt_unique["INGREDIENTE_ATIVO"].nunique()
 
+            # Comercialização por combinação (anexa só para métricas locais)
+            df_alt_com_venda = _anexar_comercializacao(df_alt_unique, df_vendas)
+            n_comerc, vol_comerc = _metricas_comercializacao(df_alt_com_venda)
+
             # --- Relatorio (uma linha por Cultura + Praga) ---
             relatorio_rows.append({
                 "Cultura": cultura,
                 "Praga": praga,
                 "nº de produtos alternativos": n_produtos,
                 "quantitativo de IA diferentes": n_ias,
-                "Produtos comercializados": "Não analisado",
+                "Produtos comercializados": n_comerc,
+                "Volume comercializado (PF)": vol_comerc,
                 "nº grupos IRAC": "Não analisado",
             })
 
@@ -1017,34 +1250,119 @@ def gerar_produtos_alternativos_por_praga(
             progress.update(1)
             continue
 
-        # Monta DataFrames finais (garante unicidade)
-        df_resumo_ia = (
-            pd.DataFrame(resumo_ia_rows)
-            .drop_duplicates(subset=["Cultura", "Praga", "IA"])
-            .sort_values(["Cultura", "IA"])
-            .reset_index(drop=True)
-        )
+        # Produtos_Alternativos (dedup global por registro — independente da cultura)
+        if lista_produtos:
+            df_produtos = pd.concat(lista_produtos, ignore_index=True)
+            df_produtos = _deduplicar_produtos_alt(df_produtos)
+            df_produtos = _anexar_comercializacao(df_produtos, df_vendas)
+            colunas_existentes = [c for c in colunas_preferidas if c in df_produtos.columns]
+            cols_venda_extra = [
+                c for c in ("Comercializado", "Venda_Cliente", "Venda_Industria", "Venda_Total_PF")
+                if c in df_produtos.columns
+            ]
+            outras = [
+                c for c in df_produtos.columns
+                if c not in colunas_existentes and c not in cols_venda_extra
+            ]
+            df_produtos = df_produtos[colunas_existentes + cols_venda_extra + outras]
+        else:
+            df_produtos = pd.DataFrame()
+
+        # --- Análise GERAL da praga (independente da cultura) ---
+        n_culturas = len(relatorio_rows)
+        if not df_produtos.empty:
+            n_produtos_geral = len(df_produtos)
+            n_ias_geral = (
+                df_produtos["INGREDIENTE_ATIVO"].nunique()
+                if "INGREDIENTE_ATIVO" in df_produtos.columns
+                else 0
+            )
+        else:
+            n_produtos_geral = 0
+            n_ias_geral = 0
+        n_comerc_geral, vol_comerc_geral = _metricas_comercializacao(df_produtos)
+
+        # Linha GERAL no topo do Relatorio
+        linha_geral = {
+            "Cultura": "GERAL (todas as culturas)",
+            "Praga": praga,
+            "nº de produtos alternativos": n_produtos_geral,
+            "quantitativo de IA diferentes": n_ias_geral,
+            "Produtos comercializados": n_comerc_geral,
+            "Volume comercializado (PF)": vol_comerc_geral,
+            "nº grupos IRAC": "Não analisado",
+        }
+
+        # Monta DataFrames finais
         df_relatorio = (
             pd.DataFrame(relatorio_rows)
             .drop_duplicates(subset=["Cultura", "Praga"])
             .sort_values("Cultura")
             .reset_index(drop=True)
         )
+        # Insere a linha GERAL como primeira linha
+        df_relatorio = pd.concat(
+            [pd.DataFrame([linha_geral]), df_relatorio],
+            ignore_index=True,
+        )
 
-        # Produtos_Alternativos
-        if lista_produtos:
-            df_produtos = pd.concat(lista_produtos, ignore_index=True)
-            # Dedup global por registro (caso mesmo produto apareça em mais de um contexto)
-            df_produtos = _deduplicar_produtos_alt(df_produtos)
-            colunas_existentes = [c for c in colunas_preferidas if c in df_produtos.columns]
-            outras = [c for c in df_produtos.columns if c not in colunas_existentes]
-            df_produtos = df_produtos[colunas_existentes + outras]
-        else:
-            df_produtos = pd.DataFrame()
+        df_resumo_ia = (
+            pd.DataFrame(resumo_ia_rows)
+            .drop_duplicates(subset=["Cultura", "Praga", "IA"])
+            .sort_values(["Cultura", "IA"])
+            .reset_index(drop=True)
+        )
+
+        # Resumo_IA também ganha visão GERAL: uma linha por IA distinto da praga
+        resumo_ia_geral_rows: List[Dict[str, Any]] = []
+        if not df_produtos.empty and "INGREDIENTE_ATIVO" in df_produtos.columns:
+            for ia_alt, grupo in df_produtos.groupby("INGREDIENTE_ATIVO", sort=False):
+                classe_uso = "Não informado"
+                if "CLASSE" in grupo.columns:
+                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                resumo_ia_geral_rows.append({
+                    "Cultura": "GERAL (todas as culturas)",
+                    "Praga": praga,
+                    "IA": ia_alt,
+                    "Classe de USO": classe_uso,
+                    "Grupo IRAC": "Não informado",
+                })
+            if resumo_ia_geral_rows:
+                df_resumo_ia = pd.concat(
+                    [
+                        pd.DataFrame(resumo_ia_geral_rows).drop_duplicates(
+                            subset=["Cultura", "Praga", "IA"]
+                        ),
+                        df_resumo_ia,
+                    ],
+                    ignore_index=True,
+                )
+
+        # Aba dedicada ao resumo geral da praga (visão rápida)
+        obs_comerc = ""
+        if n_comerc_geral != "Não analisado":
+            obs_comerc = (
+                f" Destes, {n_comerc_geral} produto(s) constam como comercializados "
+                f"(volume PF total: {vol_comerc_geral})."
+            )
+        df_resumo_geral_praga = pd.DataFrame([{
+            "Praga": praga,
+            "Nº de culturas com alternativos": n_culturas,
+            "Nº de produtos alternativos (únicos)": n_produtos_geral,
+            "Nº de ingredientes ativos diferentes": n_ias_geral,
+            "Produtos comercializados": n_comerc_geral,
+            "Volume comercializado (PF)": vol_comerc_geral,
+            "Nº grupos IRAC": "Não analisado",
+            "Observação": (
+                f"Para a praga {praga}, independente da cultura, "
+                f"existem {n_produtos_geral} produto(s) alternativo(s) "
+                f"com {n_ias_geral} ingrediente(s) ativo(s) diferente(s), "
+                f"distribuídos em {n_culturas} cultura(s).{obs_comerc}"
+            ),
+        }])
 
         # Opcional: adicionar colunas de comparação toxicológica/ambiental
         if incluir_analise and not df_produtos.empty:
-            # Aplica por cultura (tox/amb originais variam por combinação)
             dfs_com_comp = []
             for cultura in df_produtos["CULTURA"].unique():
                 mask_c = df_produtos["CULTURA"] == cultura
@@ -1064,6 +1382,9 @@ def gerar_produtos_alternativos_por_praga(
         caminho_excel = os.path.join(pasta_base, nome_arq)
 
         with pd.ExcelWriter(caminho_excel, engine="openpyxl") as writer:
+            df_resumo_geral_praga.to_excel(
+                writer, sheet_name="Resumo_Geral_Praga", index=False
+            )
             df_resumo_ia.to_excel(writer, sheet_name="Resumo_IA", index=False)
             df_relatorio.to_excel(writer, sheet_name="Relatorio", index=False)
             if not df_produtos.empty:
@@ -1087,6 +1408,263 @@ def gerar_produtos_alternativos_por_praga(
         )
     else:
         print_warning("Nenhum arquivo por praga foi gerado.")
+
+
+def gerar_produtos_alternativos_por_cultura(
+    df: pd.DataFrame,
+    ias_list: list,
+    df_combs: pd.DataFrame,
+    pasta_base: str,
+    ia_principal: Optional[str] = None,
+    incluir_analise: bool = False,
+    df_vendas: Optional[pd.DataFrame] = None,
+):
+    """
+    Gera arquivos Excel organizados por CULTURA (mesma estrutura da análise por praga).
+
+    Cada arquivo contém:
+      - Resumo_Geral_Cultura : visão consolidada da cultura (todas as pragas)
+      - Resumo_IA            : Cultura | Praga | IA | Classe de USO | Grupo IRAC
+      - Relatorio            : 1ª linha GERAL + uma linha por praga
+      - Produtos_Alternativos: detalhamento com comercialização (se disponível)
+
+    Reutiliza helpers de comercialização e deduplicação compartilhados com a
+    análise por praga.
+    """
+    print_header("Gerando Excel organizados por CULTURA (estrutura padronizada)")
+
+    Path(pasta_base).mkdir(parents=True, exist_ok=True)
+
+    culturas_unicas = df_combs["CULTURA"].dropna().astype(str).str.strip().unique()
+    culturas_unicas = sorted([c for c in culturas_unicas if c])
+
+    if not culturas_unicas:
+        print_warning("Nenhuma cultura encontrada em df_combs.")
+        return
+
+    colunas_preferidas = [
+        "CULTURA", "PRAGA_NOME_CIENTIFICO", "PRAGA_NOME_COMUM",
+        "INGREDIENTE_ATIVO", "CLASSE", "GRUPO_QUIMICO",
+        "MARCA_COMERCIAL", "NR_REGISTRO", "TITULAR_DE_REGISTRO",
+        "SITUACAO", "FORMULACAO", "CLASSE_TOXICOLOGICA", "CLASSE_AMBIENTAL",
+    ]
+
+    total = len(culturas_unicas)
+    progress = smart_progress(range(total), total=total, desc="Culturas", unit="cultura")
+    gerados = 0
+
+    for cultura in culturas_unicas:
+        df_cult_combs = df_combs[df_combs["CULTURA"].str.strip() == cultura]
+        pragas = (
+            df_cult_combs["PRAGA_NOME_CIENTIFICO"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+
+        resumo_ia_rows: List[Dict[str, Any]] = []
+        relatorio_rows: List[Dict[str, Any]] = []
+        lista_produtos: List[pd.DataFrame] = []
+
+        for praga in pragas:
+            mask_ia = ~df["INGREDIENTE_ATIVO"].isin(ias_list)
+            mask_cult = df["CULTURA"].str.lower().str.strip() == cultura.lower().strip()
+            mask_praga = (
+                df["PRAGA_NOME_CIENTIFICO"].str.lower().str.strip()
+                == praga.lower().strip()
+            )
+            df_alt = df[mask_ia & mask_cult & mask_praga].copy()
+            if df_alt.empty:
+                continue
+
+            df_alt_unique = _deduplicar_produtos_alt(df_alt)
+            n_produtos = len(df_alt_unique)
+            n_ias = df_alt_unique["INGREDIENTE_ATIVO"].nunique()
+
+            df_alt_com_venda = _anexar_comercializacao(df_alt_unique, df_vendas)
+            n_comerc, vol_comerc = _metricas_comercializacao(df_alt_com_venda)
+
+            relatorio_rows.append({
+                "Cultura": cultura,
+                "Praga": praga,
+                "nº de produtos alternativos": n_produtos,
+                "quantitativo de IA diferentes": n_ias,
+                "Produtos comercializados": n_comerc,
+                "Volume comercializado (PF)": vol_comerc,
+                "nº grupos IRAC": "Não analisado",
+            })
+
+            for ia_alt, grupo in df_alt_unique.groupby("INGREDIENTE_ATIVO", sort=False):
+                classe_uso = "Não informado"
+                if "CLASSE" in grupo.columns:
+                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                resumo_ia_rows.append({
+                    "Cultura": cultura,
+                    "Praga": praga,
+                    "IA": ia_alt,
+                    "Classe de USO": classe_uso,
+                    "Grupo IRAC": "Não informado",
+                })
+
+            lista_produtos.append(df_alt_unique)
+
+        if not relatorio_rows:
+            progress.update(1)
+            continue
+
+        if lista_produtos:
+            df_produtos = pd.concat(lista_produtos, ignore_index=True)
+            df_produtos = _deduplicar_produtos_alt(df_produtos)
+            df_produtos = _anexar_comercializacao(df_produtos, df_vendas)
+            colunas_existentes = [c for c in colunas_preferidas if c in df_produtos.columns]
+            cols_venda_extra = [
+                c for c in ("Comercializado", "Venda_Cliente", "Venda_Industria", "Venda_Total_PF")
+                if c in df_produtos.columns
+            ]
+            outras = [
+                c for c in df_produtos.columns
+                if c not in colunas_existentes and c not in cols_venda_extra
+            ]
+            df_produtos = df_produtos[colunas_existentes + cols_venda_extra + outras]
+        else:
+            df_produtos = pd.DataFrame()
+
+        n_pragas = len(relatorio_rows)
+        if not df_produtos.empty:
+            n_produtos_geral = len(df_produtos)
+            n_ias_geral = (
+                df_produtos["INGREDIENTE_ATIVO"].nunique()
+                if "INGREDIENTE_ATIVO" in df_produtos.columns
+                else 0
+            )
+        else:
+            n_produtos_geral = 0
+            n_ias_geral = 0
+        n_comerc_geral, vol_comerc_geral = _metricas_comercializacao(df_produtos)
+
+        linha_geral = {
+            "Cultura": cultura,
+            "Praga": "GERAL (todas as pragas)",
+            "nº de produtos alternativos": n_produtos_geral,
+            "quantitativo de IA diferentes": n_ias_geral,
+            "Produtos comercializados": n_comerc_geral,
+            "Volume comercializado (PF)": vol_comerc_geral,
+            "nº grupos IRAC": "Não analisado",
+        }
+
+        df_relatorio = (
+            pd.DataFrame(relatorio_rows)
+            .drop_duplicates(subset=["Cultura", "Praga"])
+            .sort_values("Praga")
+            .reset_index(drop=True)
+        )
+        df_relatorio = pd.concat(
+            [pd.DataFrame([linha_geral]), df_relatorio],
+            ignore_index=True,
+        )
+
+        df_resumo_ia = (
+            pd.DataFrame(resumo_ia_rows)
+            .drop_duplicates(subset=["Cultura", "Praga", "IA"])
+            .sort_values(["Praga", "IA"])
+            .reset_index(drop=True)
+        )
+
+        # Bloco GERAL de IAs da cultura
+        resumo_ia_geral_rows: List[Dict[str, Any]] = []
+        if not df_produtos.empty and "INGREDIENTE_ATIVO" in df_produtos.columns:
+            for ia_alt, grupo in df_produtos.groupby("INGREDIENTE_ATIVO", sort=False):
+                classe_uso = "Não informado"
+                if "CLASSE" in grupo.columns:
+                    classe_uso = _obter_classe_uso(grupo["CLASSE"])
+                resumo_ia_geral_rows.append({
+                    "Cultura": cultura,
+                    "Praga": "GERAL (todas as pragas)",
+                    "IA": ia_alt,
+                    "Classe de USO": classe_uso,
+                    "Grupo IRAC": "Não informado",
+                })
+            if resumo_ia_geral_rows:
+                df_resumo_ia = pd.concat(
+                    [
+                        pd.DataFrame(resumo_ia_geral_rows).drop_duplicates(
+                            subset=["Cultura", "Praga", "IA"]
+                        ),
+                        df_resumo_ia,
+                    ],
+                    ignore_index=True,
+                )
+
+        obs_comerc = ""
+        if n_comerc_geral != "Não analisado":
+            obs_comerc = (
+                f" Destes, {n_comerc_geral} produto(s) constam como comercializados "
+                f"(volume PF total: {vol_comerc_geral})."
+            )
+        df_resumo_geral = pd.DataFrame([{
+            "Cultura": cultura,
+            "Nº de pragas com alternativos": n_pragas,
+            "Nº de produtos alternativos (únicos)": n_produtos_geral,
+            "Nº de ingredientes ativos diferentes": n_ias_geral,
+            "Produtos comercializados": n_comerc_geral,
+            "Volume comercializado (PF)": vol_comerc_geral,
+            "Nº grupos IRAC": "Não analisado",
+            "Observação": (
+                f"Para a cultura {cultura}, "
+                f"existem {n_produtos_geral} produto(s) alternativo(s) "
+                f"com {n_ias_geral} ingrediente(s) ativo(s) diferente(s), "
+                f"cobrindo {n_pragas} praga(s).{obs_comerc}"
+            ),
+        }])
+
+        if incluir_analise and not df_produtos.empty:
+            dfs_com_comp = []
+            for praga_u in df_produtos["PRAGA_NOME_CIENTIFICO"].dropna().unique():
+                mask_p = df_produtos["PRAGA_NOME_CIENTIFICO"] == praga_u
+                df_p = df_produtos[mask_p].copy()
+                tox_orig = get_tox_original(
+                    df, ias_list, cultura, praga_u, "CLASSE_TOXICOLOGICA"
+                )
+                amb_orig = get_tox_original(
+                    df, ias_list, cultura, praga_u, "CLASSE_AMBIENTAL", True
+                )
+                df_p = adicionar_colunas_comparacao(df_p, tox_orig, amb_orig)
+                dfs_com_comp.append(df_p)
+            if dfs_com_comp:
+                df_produtos = pd.concat(dfs_com_comp, ignore_index=True)
+
+        nome_arq = f"{sanitize_filename(cultura)}.xlsx"
+        caminho_excel = os.path.join(pasta_base, nome_arq)
+
+        with pd.ExcelWriter(caminho_excel, engine="openpyxl") as writer:
+            df_resumo_geral.to_excel(
+                writer, sheet_name="Resumo_Geral_Cultura", index=False
+            )
+            df_resumo_ia.to_excel(writer, sheet_name="Resumo_IA", index=False)
+            df_relatorio.to_excel(writer, sheet_name="Relatorio", index=False)
+            if not df_produtos.empty:
+                df_produtos.to_excel(
+                    writer, sheet_name="Produtos_Alternativos", index=False
+                )
+            else:
+                pd.DataFrame(
+                    [["Nenhum produto alternativo encontrado"]], columns=["Info"]
+                ).to_excel(writer, sheet_name="Produtos_Alternativos", index=False)
+
+        gerados += 1
+        progress.update(1)
+
+    if hasattr(progress, "close"):
+        progress.close()
+
+    if gerados > 0:
+        print_success(
+            f"Gerados {gerados} arquivos Excel por cultura em: {pasta_base}"
+        )
+    else:
+        print_warning("Nenhum arquivo por cultura foi gerado.")
 
 
 def carregar_dados_vendas_em_memoria():
@@ -1309,6 +1887,30 @@ def main():
             pasta_base_raiz = str(SAIDA_DIR / "Produtos_alternativos_por_IA")
             Path(pasta_base_raiz).mkdir(exist_ok=True)
             print_header("MODO 3 - IA + ALTERNATIVOS")
+
+            # Comercialização opcional (Tabela Bruta / planilhas anuais)
+            print(
+                "Deseja carregar tabela de comercialização? "
+                "(s = buscar em dados/ / n = pular)"
+            )
+            if NO_INPUT:
+                resp_comerc = "s"
+                print_success("Modo não-interativo: tentando carregar comercialização automaticamente.")
+            else:
+                resp_comerc = input("> ").strip().lower()
+            df_vendas_mod3 = None
+            if resp_comerc in ["s", "sim", "y", "yes", ""]:
+                df_vendas_mod3 = carregar_tabela_comercializacao(pasta_busca=DADOS_DIR)
+                if df_vendas_mod3 is None:
+                    print_warning(
+                        "Nenhuma tabela de comercialização encontrada. "
+                        "Análise seguirá sem dados de venda."
+                    )
+                else:
+                    print_success(
+                        f"Comercialização ativa: {len(df_vendas_mod3):,} produtos na base de vendas."
+                    )
+
             while True:
                 ia = input(f"{bcolors.OKBLUE}Ingrediente Ativo (ou 'voltar'): {bcolors.ENDC}").strip()
                 if ia.lower() in ["voltar", "v", ""]:
@@ -1323,81 +1925,101 @@ def main():
                 ia_pasta = sanitize_filename(ia)
                 pasta_ia = os.path.join(pasta_base_raiz, ia_pasta)
 
-                # Estrutura por CULTURA (comportamento original — mantida intacta)
-                pasta_com = os.path.join(pasta_ia, "Com_Analise")
-                pasta_sem = os.path.join(pasta_ia, "Sem_Analise")
-                Path(pasta_com).mkdir(parents=True, exist_ok=True)
-                Path(pasta_sem).mkdir(parents=True, exist_ok=True)
+                # Por CULTURA (estrutura padronizada = mesma da por praga)
+                pasta_cult_com = os.path.join(pasta_ia, "Por_Cultura", "Com_Analise")
+                pasta_cult_sem = os.path.join(pasta_ia, "Por_Cultura", "Sem_Analise")
+                Path(pasta_cult_com).mkdir(parents=True, exist_ok=True)
+                Path(pasta_cult_sem).mkdir(parents=True, exist_ok=True)
 
-                # Estrutura por PRAGA (nova funcionalidade, paralela)
+                # Por PRAGA
                 pasta_praga_com = os.path.join(pasta_ia, "Por_Praga", "Com_Analise")
                 pasta_praga_sem = os.path.join(pasta_ia, "Por_Praga", "Sem_Analise")
                 Path(pasta_praga_com).mkdir(parents=True, exist_ok=True)
                 Path(pasta_praga_sem).mkdir(parents=True, exist_ok=True)
 
-                resumo_path = os.path.join(pasta_ia, f"Resumo_{ia_pasta}_{len(ias_selecionados)}_selecionados.csv")
+                # Legado (CSV individual / abas antigas) — mantido para compatibilidade
+                pasta_legado_com = os.path.join(pasta_ia, "Legado_Abas_Por_Praga", "Com_Analise")
+                pasta_legado_sem = os.path.join(pasta_ia, "Legado_Abas_Por_Praga", "Sem_Analise")
+                Path(pasta_legado_com).mkdir(parents=True, exist_ok=True)
+                Path(pasta_legado_sem).mkdir(parents=True, exist_ok=True)
+
+                resumo_path = os.path.join(
+                    pasta_ia, f"Resumo_{ia_pasta}_{len(ias_selecionados)}_selecionados.csv"
+                )
                 df_combs.to_csv(resumo_path, sep=";", index=False, encoding="utf-8-sig")
                 print_success(f"Resumo: {resumo_path}")
-                print(df_combs.head(15)[["Id", "CULTURA", "PRAGA_NOME_CIENTIFICO", "NR_PRODUTOS_ALTERNATIVOS"]].to_string(index=False))
+                print(
+                    df_combs.head(15)[
+                        ["Id", "CULTURA", "PRAGA_NOME_CIENTIFICO", "NR_PRODUTOS_ALTERNATIVOS"]
+                    ].to_string(index=False)
+                )
 
                 print_header("EXPORTAÇÃO")
-                print("  0 / todas     → Excel TODAS as culturas + TODAS as pragas")
-                print("  c + nº        → Excel UMA cultura (ex: c1)")
-                print("  p + nº        → CSV UMA combinação (ex: p1)")
+                print("  0 / todas     → Excel POR CULTURA + POR PRAGA (estrutura padronizada)")
+                print("  cultura / cu  → Excel organizados POR CULTURA (todas)")
                 print("  praga / pr    → Excel organizados POR PRAGA (todas)")
+                print("  c + nº        → Excel legado UMA cultura (abas por praga)")
+                print("  p + nº        → CSV UMA combinação (ex: p1)")
                 print("  voltar")
                 while True:
-                    escolha = input(f"{bcolors.BOLD}Escolha: {bcolors.ENDC}").strip().lower().replace(" ", "")
+                    escolha = input(
+                        f"{bcolors.BOLD}Escolha: {bcolors.ENDC}"
+                    ).strip().lower().replace(" ", "")
                     if escolha in ["voltar", "v", ""]:
                         break
                     if escolha in ["0", "todas", "t", "all"]:
-                        # 1) Por CULTURA (comportamento original)
-                        culturas_unicas = df_combs["CULTURA"].unique()
-                        progress = smart_progress(
-                            range(len(culturas_unicas)),
-                            total=len(culturas_unicas),
-                            desc="Culturas",
+                        gerar_produtos_alternativos_por_cultura(
+                            df, ias_selecionados, df_combs, pasta_cult_com,
+                            ia, True, df_vendas_mod3,
                         )
-                        for cultura in culturas_unicas:
-                            df_c = df_combs[df_combs["CULTURA"] == cultura]
-                            gerar_excel_por_cultura(
-                                df, ias_selecionados, cultura, df_c, pasta_com, True, ia
-                            )
-                            gerar_excel_por_cultura(
-                                df, ias_selecionados, cultura, df_c, pasta_sem, False, ia
-                            )
-                            progress.update(1)
-                        progress.close()
-
-                        # 2) Por PRAGA (nova funcionalidade — reutiliza df_combs)
-                        gerar_produtos_alternativos_por_praga(
-                            df, ias_selecionados, df_combs, pasta_praga_com, ia, True
+                        gerar_produtos_alternativos_por_cultura(
+                            df, ias_selecionados, df_combs, pasta_cult_sem,
+                            ia, False, df_vendas_mod3,
                         )
                         gerar_produtos_alternativos_por_praga(
-                            df, ias_selecionados, df_combs, pasta_praga_sem, ia, False
+                            df, ias_selecionados, df_combs, pasta_praga_com,
+                            ia, True, df_vendas_mod3,
+                        )
+                        gerar_produtos_alternativos_por_praga(
+                            df, ias_selecionados, df_combs, pasta_praga_sem,
+                            ia, False, df_vendas_mod3,
                         )
                         print_success("Geração concluída (Por Cultura + Por Praga)!")
+                    elif escolha in ["cultura", "cu", "porcultura", "por_cultura"]:
+                        gerar_produtos_alternativos_por_cultura(
+                            df, ias_selecionados, df_combs, pasta_cult_com,
+                            ia, True, df_vendas_mod3,
+                        )
+                        gerar_produtos_alternativos_por_cultura(
+                            df, ias_selecionados, df_combs, pasta_cult_sem,
+                            ia, False, df_vendas_mod3,
+                        )
+                        print_success("Geração por CULTURA concluída!")
                     elif escolha in ["praga", "pr", "porpraga", "por_praga"]:
                         gerar_produtos_alternativos_por_praga(
-                            df, ias_selecionados, df_combs, pasta_praga_com, ia, True
+                            df, ias_selecionados, df_combs, pasta_praga_com,
+                            ia, True, df_vendas_mod3,
                         )
                         gerar_produtos_alternativos_por_praga(
-                            df, ias_selecionados, df_combs, pasta_praga_sem, ia, False
+                            df, ias_selecionados, df_combs, pasta_praga_sem,
+                            ia, False, df_vendas_mod3,
                         )
                         print_success("Geração por PRAGA concluída!")
-                    elif escolha.startswith("c"):
+                    elif escolha.startswith("c") and escolha not in ("cultura", "cu"):
                         try:
                             idx = int(escolha[1:])
                             if 1 <= idx <= len(df_combs):
                                 cultura = df_combs.iloc[idx - 1]["CULTURA"]
                                 df_c = df_combs[df_combs["CULTURA"] == cultura]
                                 gerar_excel_por_cultura(
-                                    df, ias_selecionados, cultura, df_c, pasta_com, True, ia
+                                    df, ias_selecionados, cultura, df_c,
+                                    pasta_legado_com, True, ia,
                                 )
                                 gerar_excel_por_cultura(
-                                    df, ias_selecionados, cultura, df_c, pasta_sem, False, ia
+                                    df, ias_selecionados, cultura, df_c,
+                                    pasta_legado_sem, False, ia,
                                 )
-                                print_success(f"Excel: {cultura}")
+                                print_success(f"Excel legado: {cultura}")
                             else:
                                 print_warning(f"Use 1 até {len(df_combs)}")
                         except ValueError:
@@ -1408,22 +2030,14 @@ def main():
                             if 1 <= idx <= len(df_combs):
                                 linha = df_combs.iloc[idx - 1]
                                 gerar_csv_individual(
-                                    df,
-                                    ias_selecionados,
-                                    linha["CULTURA"],
-                                    linha["PRAGA_NOME_CIENTIFICO"],
-                                    pasta_com,
-                                    True,
-                                    True,
+                                    df, ias_selecionados,
+                                    linha["CULTURA"], linha["PRAGA_NOME_CIENTIFICO"],
+                                    pasta_legado_com, True, True,
                                 )
                                 gerar_csv_individual(
-                                    df,
-                                    ias_selecionados,
-                                    linha["CULTURA"],
-                                    linha["PRAGA_NOME_CIENTIFICO"],
-                                    pasta_sem,
-                                    True,
-                                    False,
+                                    df, ias_selecionados,
+                                    linha["CULTURA"], linha["PRAGA_NOME_CIENTIFICO"],
+                                    pasta_legado_sem, True, False,
                                 )
                             else:
                                 print_warning(f"Use 1 até {len(df_combs)}")
